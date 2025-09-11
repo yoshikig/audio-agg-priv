@@ -1,0 +1,7 @@
+# Tell Cargo to use the cross-compilation linker for the aarch64 target.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-unknown-linux-gnu-gcc"
+
+# If you were targeting a 32-bit Pi, you would add this section:
+# [target.armv7-unknown-linux-gnueabihf]
+# linker = "arm-linux-gnueabihf-gcc"
