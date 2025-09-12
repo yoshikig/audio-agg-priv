@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-// intentionally unused: no VecDeque usage remains
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
@@ -8,7 +7,7 @@ use std::sync::mpsc;
 use sound_send::rate::RollingRate;
 use sound_send::packet::{encode_packet, Meta};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sound_send::sync::{decode as sync_decode, encode as sync_encode, SyncMessage};
+use sound_send::packet::{decode_message, encode_sync, Message, SyncMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
@@ -116,7 +115,7 @@ fn main() -> Result<()> {
             std::thread::spawn(move || {
                 let mut stdin = io::stdin().lock();
                 // Use a buffer that fits roughly within a UDP payload
-                // once the ~16B header is added
+                // once the ~24B header is added
                 const MAX_PAYLOAD: usize = 1200;
                 let mut buf = vec![0u8; MAX_PAYLOAD];
                 loop {
@@ -244,7 +243,7 @@ fn spawn_timesync_responder(socket: &UdpSocket) {
         let mut buf = [0u8; 64];
         match sock.recv_from(&mut buf) {
             Ok((n, addr)) => {
-                if let Some(SyncMessage::Ping { t0_ms }) = sync_decode(&buf[..n]) {
+                if let Ok(Message::Sync(SyncMessage::Ping { t0_ms })) = decode_message(&buf[..n]) {
                     let t1 = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_else(|_| Duration::from_millis(0))
@@ -254,7 +253,7 @@ fn spawn_timesync_responder(socket: &UdpSocket) {
                         .unwrap_or_else(|_| Duration::from_millis(0))
                         .as_millis() as u64;
                     let pong = SyncMessage::Pong { t0_ms, t1_ms: t1, t2_ms: t2 };
-                    let v = sync_encode(pong);
+                    let v = encode_sync(&pong);
                     let _ = sock.send_to(&v, addr);
                 }
             }

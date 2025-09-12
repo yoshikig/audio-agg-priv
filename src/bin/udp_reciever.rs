@@ -3,9 +3,8 @@ use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sound_send::rate::{RollingRate, RollingMean};
-use sound_send::sync::{decode as sync_decode, encode as sync_encode, SyncMessage};
+use sound_send::packet::{decode_message, encode_sync, Message, SyncMessage};
 use sound_send::timesync::TimeSyncEstimator;
-use sound_send::packet::decode_packet;
 use std::process::{Command, Stdio};
 
 fn main() -> io::Result<()> {
@@ -82,98 +81,96 @@ fn main() -> io::Result<()> {
         // Receive data; get byte count and source address
         let (bytes_received, src_addr) = socket.recv_from(&mut buf)?;
 
-        // First, check for sync control message
-        if let Some(msg) = sync_decode(&buf[..bytes_received]) {
-            match msg {
-                SyncMessage::Pong { t0_ms, t1_ms, t2_ms } => {
-                    // t3 is now
-                    let t3_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_else(|_| Duration::from_millis(0))
-                        .as_millis() as u64;
-                    let _state = ts_est.update(t0_ms, t1_ms, t2_ms, t3_ms);
-                }
-                _ => {}
+        // Decode control or audio packet in a unified match
+        let data = &buf[..bytes_received];
+        match decode_message(data) {
+            Ok(Message::Sync(SyncMessage::Pong { t0_ms, t1_ms, t2_ms })) => {
+                // t3 is now
+                let t3_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_millis(0))
+                    .as_millis() as u64;
+                let _state = ts_est.update(t0_ms, t1_ms, t2_ms, t3_ms);
             }
-            continue;
-        }
-
-        // Decode audio packet (magic, length, meta, sequence, payload)
-        let decoded = match decode_packet(&buf[..bytes_received]) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        last_sender = Some(src_addr);
-        let received_sequence = decoded.seq;
-        let payload = decoded.payload;
-        let sent_ts_ms = decoded.timestamp_ms;
-
-        total_bytes_received += bytes_received as u64;
-        total_packets_received += 1;
-
-        // Update rolling byte rate
-        let now_inst = Instant::now();
-        byte_rate.record(now_inst, payload.len() as u64);
-        // Compute latency in ms using system clock; saturate at 0 if clock skew
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_millis(0))
-            .as_millis() as u64;
-        // Adjust latency by current offset estimate
-        let offset_ms = ts_est.state().offset_ms;
-        let adj_now_ms = (now_ms as i128 - offset_ms as i128).max(0) as u64;
-        let latency_ms = adj_now_ms.saturating_sub(sent_ts_ms);
-        latency_mean.record(now_inst, latency_ms as f64);
-
-        // Check packet loss/order; write payload only for in-order packets
-        if received_sequence == expected_sequence {
-            // In-order packet: write payload
-            if use_pipewire {
-                if pw_stdin.is_none() {
-                    let fmt = match decoded.meta.sample_format {
-                        sound_send::packet::SampleFormat::F32 => "f32",
-                        sound_send::packet::SampleFormat::I16 => "s16",
-                        sound_send::packet::SampleFormat::U16 => "u16",
-                        _ => "f32",
-                    };
-                    let rate = (decoded.meta.sample_rate.0).to_string();
-                    let ch = decoded.meta.channels.to_string();
-                    let mut child = Command::new("pw-cat")
-                        .arg("--playback")
-                        .arg("--rate")
-                        .arg(rate)
-                        .arg("--channels")
-                        .arg(ch)
-                        .arg("--format")
-                        .arg(fmt)
-                        .arg("-")
-                        .stdin(Stdio::piped())
-                        .spawn()?;
-                    pw_stdin = child.stdin.take();
-                }
-                if let Some(stdin) = pw_stdin.as_mut() {
-                    stdin.write_all(payload)?;
-                }
-            } else {
-                stdout.write_all(payload)?;
+            Ok(Message::Sync(SyncMessage::Ping { .. })) => {
+                // Ignore pings on receiver side
             }
-            expected_sequence += 1;
-        } else if received_sequence > expected_sequence {
-            // Some packets were lost.
-            // This packet is in-order relative to its sequence; write payload
-            if use_pipewire {
-                if let Some(stdin) = pw_stdin.as_mut() {
-                    stdin.write_all(payload)?;
+            Ok(Message::Data(decoded)) => {
+                last_sender = Some(src_addr);
+                let received_sequence = decoded.seq;
+                let payload = decoded.payload;
+                let sent_ts_ms = decoded.timestamp_ms;
+
+                total_bytes_received += bytes_received as u64;
+                total_packets_received += 1;
+
+                // Update rolling byte rate and latency
+                let now_inst = Instant::now();
+                byte_rate.record(now_inst, payload.len() as u64);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_millis(0))
+                    .as_millis() as u64;
+                let offset_ms = ts_est.state().offset_ms;
+                let adj_now_ms = (now_ms as i128 - offset_ms as i128).max(0) as u64;
+                let latency_ms = adj_now_ms.saturating_sub(sent_ts_ms);
+                latency_mean.record(now_inst, latency_ms as f64);
+
+                // Check packet loss/order; write payload only for in-order packets
+                if received_sequence == expected_sequence {
+                    // In-order packet: write payload
+                    if use_pipewire {
+                        if pw_stdin.is_none() {
+                            let fmt = match decoded.meta.sample_format {
+                                sound_send::packet::SampleFormat::F32 => "f32",
+                                sound_send::packet::SampleFormat::I16 => "s16",
+                                sound_send::packet::SampleFormat::U16 => "u16",
+                                _ => "f32",
+                            };
+                            let rate = (decoded.meta.sample_rate.0).to_string();
+                            let ch = decoded.meta.channels.to_string();
+                            let mut child = Command::new("pw-cat")
+                                .arg("--playback")
+                                .arg("--rate")
+                                .arg(rate)
+                                .arg("--channels")
+                                .arg(ch)
+                                .arg("--format")
+                                .arg(fmt)
+                                .arg("-")
+                                .stdin(Stdio::piped())
+                                .spawn()?;
+                            pw_stdin = child.stdin.take();
+                        }
+                        if let Some(stdin) = pw_stdin.as_mut() {
+                            stdin.write_all(payload)?;
+                        }
+                    } else {
+                        stdout.write_all(payload)?;
+                    }
+                    expected_sequence += 1;
+                } else if received_sequence > expected_sequence {
+                    // Some packets were lost.
+                    // This packet is in-order relative to its sequence; write payload
+                    if use_pipewire {
+                        if let Some(stdin) = pw_stdin.as_mut() {
+                            stdin.write_all(payload)?;
+                        }
+                    } else {
+                        stdout.write_all(payload)?;
+                    }
+                    let lost_count = received_sequence - expected_sequence;
+                    lost_packets += lost_count;
+                    expected_sequence = received_sequence + 1;
+                } else { // received_sequence < expected_sequence
+                    // Late/out-of-order packet: count it but do not write payload
+                    out_of_order_packets += 1;
                 }
-            } else {
-                stdout.write_all(payload)?;
             }
-            let lost_count = received_sequence - expected_sequence;
-            lost_packets += lost_count;
-            expected_sequence = received_sequence + 1;
-        } else { // received_sequence < expected_sequence
-            // Late/out-of-order packet: count it but do not write payload
-            out_of_order_packets += 1;
+            Err(_) => {
+                // Unknown payload; skip
+                continue;
+            }
         }
 
         // Update and print stats periodically
@@ -221,7 +218,7 @@ fn main() -> io::Result<()> {
                     .as_millis() as u64;
                 if now_ms.saturating_sub(last_ping_ms) >= 1_000 {
                     let ping = SyncMessage::Ping { t0_ms: now_ms };
-                    let v = sync_encode(ping);
+                    let v = encode_sync(&ping);
                     let _ = socket.send_to(&v, addr);
                     last_ping_ms = now_ms;
                 }
