@@ -5,9 +5,9 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
 use sound_send::rate::RollingRate;
 use sound_send::packet::{encode_packet, Meta};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
@@ -146,7 +146,11 @@ fn main() -> Result<()> {
     println!("Sending started. Press Ctrl+C to stop.");
 
     for audio_chunk in rx {
-        let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta);
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_millis(0));
+        let ts_ms = now_ts.as_millis() as u64;
+        let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
 
         socket
             .send_to(&send_buf, &server_addr)
@@ -193,7 +197,7 @@ where
             // Data is interleaved. Send in reasonably small chunks.
             // For now, split the current callback buffer into UDP-sized chunks.
             let bytes: &[u8] = bytemuck::cast_slice(data);
-            // Split to avoid exceeding typical MTU when adding our ~16-byte header
+            // Split to avoid exceeding typical MTU when adding our ~24-byte header
             const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
             let mut offset = 0;
             while offset < bytes.len() {

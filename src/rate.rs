@@ -45,6 +45,42 @@ impl RollingRate {
     }
 }
 
+/// Rolling window mean calculator for arbitrary values.
+#[derive(Debug)]
+pub struct RollingMean {
+    window: Duration,
+    history: VecDeque<(Instant, f64)>,
+    sum: f64,
+}
+
+impl RollingMean {
+    pub fn new(window: Duration) -> Self {
+        Self { window, history: VecDeque::new(), sum: 0.0 }
+    }
+
+    pub fn record(&mut self, now: Instant, value: f64) {
+        self.history.push_back((now, value));
+        self.sum += value;
+        self.prune(now);
+    }
+
+    pub fn average(&mut self, now: Instant) -> f64 {
+        self.prune(now);
+        if self.history.is_empty() { 0.0 } else { self.sum / (self.history.len() as f64) }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&(t, v)) = self.history.front() {
+            if now.duration_since(t) > self.window {
+                self.sum -= v;
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +120,18 @@ mod tests {
         let rate = r.rate_per_sec(now);
         assert!((rate - 100.0).abs() < 1e-9, "rate was {rate}");
     }
-}
 
+    #[test]
+    fn rolling_mean_basic() {
+        let base = Instant::now();
+        let mut m = RollingMean::new(Duration::from_secs(10));
+        for i in 0..10 {
+            let t = base.checked_add(Duration::from_secs(i)).unwrap();
+            m.record(t, 10.0 + i as f64);
+        }
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        let avg = m.average(now);
+        // average of 10..19 is 14.5
+        assert!((avg - 14.5).abs() < 1e-9, "avg was {avg}");
+    }
+}

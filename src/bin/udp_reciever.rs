@@ -1,22 +1,49 @@
 use std::env;
 use std::io::{self, Write};
 use std::net::UdpSocket;
-use std::time::{Duration, Instant};
-use sound_send::rate::RollingRate;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sound_send::rate::{RollingRate, RollingMean};
 use sound_send::packet::decode_packet;
+use std::process::{Command, Stdio};
 
 fn main() -> io::Result<()> {
-    // 1. Parse listening address from command-line args
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <listen_addr:port>", args[0]);
-        eprintln!("Example: {} 127.0.0.1:12345", args[0]);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid arguments",
-        ));
+    // 1. Parse listening address and options
+    let mut args = env::args();
+    let prog = args.next().unwrap_or_else(|| "udp_reciever".into());
+    let mut listen_addr: Option<String> = None;
+    let mut use_pipewire = false;
+    for arg in args {
+        match arg.as_str() {
+            "--pipewire" => use_pipewire = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "Usage: {} <listen_addr:port> [--pipewire]",
+                    prog
+                );
+                eprintln!("Example: {} 127.0.0.1:12345", prog);
+                return Ok(());
+            }
+            s if s.starts_with('-') => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown flag: {}", s),
+                ));
+            }
+            s => {
+                if listen_addr.is_none() {
+                    listen_addr = Some(s.to_string());
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unexpected argument: {}", s),
+                    ));
+                }
+            }
+        }
     }
-    let listen_addr = &args[1];
+    let listen_addr = listen_addr.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "missing listen address")
+    })?;
 
     // 2. Bind UDP socket and start listening
     let socket = UdpSocket::bind(listen_addr)?;
@@ -37,9 +64,12 @@ fn main() -> io::Result<()> {
 
     // Rolling byte rate over the last WINDOW
     let mut byte_rate = RollingRate::new(WINDOW);
+    // Rolling latency mean (ms) over the last WINDOW
+    let mut latency_mean = RollingMean::new(WINDOW);
 
-    // Lock stdout for efficient writing
+    // Output sinks (stdout or PipeWire via pw-cat)
     let mut stdout = io::stdout().lock();
+    let mut pw_stdin: Option<std::process::ChildStdin> = None;
 
     // 4. Receive loop
     loop {
@@ -53,6 +83,7 @@ fn main() -> io::Result<()> {
         };
         let received_sequence = decoded.seq;
         let payload = decoded.payload;
+        let sent_ts_ms = decoded.timestamp_ms;
 
         total_bytes_received += bytes_received as u64;
         total_packets_received += 1;
@@ -60,16 +91,57 @@ fn main() -> io::Result<()> {
         // Update rolling byte rate
         let now_inst = Instant::now();
         byte_rate.record(now_inst, payload.len() as u64);
+        // Compute latency in ms using system clock; saturate at 0 if clock skew
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_millis(0))
+            .as_millis() as u64;
+        let latency_ms = now_ms.saturating_sub(sent_ts_ms);
+        latency_mean.record(now_inst, latency_ms as f64);
 
         // Check packet loss/order; write payload only for in-order packets
         if received_sequence == expected_sequence {
             // In-order packet: write payload
-            stdout.write_all(payload)?;
+            if use_pipewire {
+                if pw_stdin.is_none() {
+                    let fmt = match decoded.meta.sample_format {
+                        sound_send::packet::SampleFormat::F32 => "f32",
+                        sound_send::packet::SampleFormat::I16 => "s16",
+                        sound_send::packet::SampleFormat::U16 => "u16",
+                        _ => "f32",
+                    };
+                    let rate = (decoded.meta.sample_rate.0).to_string();
+                    let ch = decoded.meta.channels.to_string();
+                    let mut child = Command::new("pw-cat")
+                        .arg("--playback")
+                        .arg("--rate")
+                        .arg(rate)
+                        .arg("--channels")
+                        .arg(ch)
+                        .arg("--format")
+                        .arg(fmt)
+                        .arg("-")
+                        .stdin(Stdio::piped())
+                        .spawn()?;
+                    pw_stdin = child.stdin.take();
+                }
+                if let Some(stdin) = pw_stdin.as_mut() {
+                    stdin.write_all(payload)?;
+                }
+            } else {
+                stdout.write_all(payload)?;
+            }
             expected_sequence += 1;
         } else if received_sequence > expected_sequence {
             // Some packets were lost.
             // This packet is in-order relative to its sequence; write payload
-            stdout.write_all(payload)?;
+            if use_pipewire {
+                if let Some(stdin) = pw_stdin.as_mut() {
+                    stdin.write_all(payload)?;
+                }
+            } else {
+                stdout.write_all(payload)?;
+            }
             let lost_count = received_sequence - expected_sequence;
             lost_packets += lost_count;
             expected_sequence = received_sequence + 1;
@@ -84,6 +156,7 @@ fn main() -> io::Result<()> {
             // Rolling average over the last WINDOW seconds
             let bytes_per_sec = byte_rate.rate_per_sec(now);
             let average_rate_kbs = bytes_per_sec / 1024.0;
+            let avg_latency_ms = latency_mean.average(now);
 
             // Print stats in a single line (carriage return to overwrite)
             let total_expected_packets = expected_sequence;
@@ -95,13 +168,14 @@ fn main() -> io::Result<()> {
 
             eprint!(
                 "\rRecv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-                 Avg10s: {:.2} KB/s from {}   ",
+                 Avg10s: {:.2} KB/s | Lat10s: {:.2} ms from {}   ",
                 total_packets_received,
                 lost_packets,
                 loss_percentage,
                 out_of_order_packets,
                 total_bytes_received as f64 / (1024.0 * 1024.0),
                 average_rate_kbs,
+                avg_latency_ms,
                 src_addr
             );
             // Flush to stderr immediately
