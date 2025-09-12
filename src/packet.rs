@@ -21,7 +21,8 @@ pub use compat::{SampleFormat, SampleRate};
 /// Simple packet format utilities.
 ///
 /// Packet layout (big-endian):
-/// - 2 bytes: magic (unique header), fixed to b"SS"
+/// - 1 byte : magic (fixed to b'S')
+/// - 1 byte : version (bumped when layout changes)
 /// - 2 bytes: payload length (u16)
 /// - 1 byte : channels
 /// - 1 byte : sample rate in kHz (rounded)
@@ -32,13 +33,15 @@ pub use compat::{SampleFormat, SampleRate};
 ///
 /// These helpers are used by both sender and receiver.
 
-pub const MAGIC: [u8; 2] = *b"SS";
+pub const MAGIC: u8 = b'S';
+pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 2 + 2 + 1 + 1 + 1 + 1 + 8; // 16 bytes
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketError {
     TooShort,
     BadMagic,
+    BadVersion,
     LengthMismatch,
 }
 
@@ -60,7 +63,8 @@ pub struct Decoded<'a> {
 pub fn encode_packet(seq: u64, payload: &[u8], meta: Meta) -> Vec<u8> {
     let len: u16 = payload.len().min(u16::MAX as usize) as u16;
     let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-    buf.extend_from_slice(&MAGIC);
+    buf.push(MAGIC);
+    buf.push(VERSION);
     buf.extend_from_slice(&len.to_be_bytes());
     buf.push(meta.channels);
     // sample rate encoded as kHz (rounded), 1 byte
@@ -86,9 +90,8 @@ pub fn decode_packet<'a>(data: &'a [u8]) -> Result<Decoded<'a>, PacketError> {
     if data.len() < HEADER_LEN {
         return Err(PacketError::TooShort);
     }
-    if data[0..2] != MAGIC {
-        return Err(PacketError::BadMagic);
-    }
+    if data[0] != MAGIC { return Err(PacketError::BadMagic); }
+    if data[1] != VERSION { return Err(PacketError::BadVersion); }
     let mut len_buf = [0u8; 2];
     len_buf.copy_from_slice(&data[2..4]);
     let payload_len = u16::from_be_bytes(len_buf) as usize;
@@ -150,16 +153,20 @@ mod tests {
     }
 
     #[test]
-    fn enforces_length_and_magic() {
+    fn enforces_length_and_magic_and_version() {
         let meta = Meta {
             channels: 1,
             sample_rate: SampleRate(44_000),
             sample_format: SampleFormat::I16,
         };
         let pkt = encode_packet(1, b"abc", meta);
-        let mut bad = pkt.clone();
-        bad[0] = 0; // break magic
-        assert_eq!(decode_packet(&bad), Err(PacketError::BadMagic));
+        let mut bad_magic = pkt.clone();
+        bad_magic[0] = 0; // break magic
+        assert_eq!(decode_packet(&bad_magic), Err(PacketError::BadMagic));
+
+        let mut bad_version = pkt.clone();
+        bad_version[1] = VERSION.wrapping_add(1); // wrong version
+        assert_eq!(decode_packet(&bad_version), Err(PacketError::BadVersion));
 
         let mut short = pkt.clone();
         short.truncate(HEADER_LEN + 1); // says 3 but only 1 provided
