@@ -35,8 +35,7 @@ fn main() -> io::Result<()> {
     const UPDATE_INTERVAL: Duration = Duration::from_millis(200); // stats update interval (0.2s)
     const WINDOW: Duration = Duration::from_secs(10);
 
-    // Rolling rates over the last WINDOW
-    let mut pkt_rate = RollingRate::new(WINDOW);
+    // Rolling byte rate over the last WINDOW
     let mut byte_rate = RollingRate::new(WINDOW);
 
     // Lock stdout for efficient writing
@@ -58,9 +57,8 @@ fn main() -> io::Result<()> {
         total_bytes_received += bytes_received as u64;
         total_packets_received += 1;
 
-        // Update rolling rates
+        // Update rolling byte rate
         let now_inst = Instant::now();
-        pkt_rate.record(now_inst, 1);
         byte_rate.record(now_inst, payload.len() as u64);
 
         // Check packet loss/order; write payload only for in-order packets
@@ -83,8 +81,7 @@ fn main() -> io::Result<()> {
         // Update and print stats periodically
         let now = Instant::now();
         if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
-            // Rolling averages over the last WINDOW seconds
-            let pkt_per_sec = pkt_rate.rate_per_sec(now);
+            // Rolling average over the last WINDOW seconds
             let bytes_per_sec = byte_rate.rate_per_sec(now);
             let average_rate_kbs = bytes_per_sec / 1024.0;
 
@@ -98,14 +95,13 @@ fn main() -> io::Result<()> {
 
             eprint!(
                 "\rRecv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-                 Avg10s: {:.2} KB/s | Pkts10s: {:.2}/s from {}   ",
+                 Avg10s: {:.2} KB/s from {}   ",
                 total_packets_received,
                 lost_packets,
                 loss_percentage,
                 out_of_order_packets,
                 total_bytes_received as f64 / (1024.0 * 1024.0),
                 average_rate_kbs,
-                pkt_per_sec,
                 src_addr
             );
             // Flush to stderr immediately
