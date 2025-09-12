@@ -1,7 +1,18 @@
 [package]
 name = "sound-send"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-anyhow = "1.0.99"
+anyhow = "1.0"
+cpal = { version = "0.15", optional = true }
+bytemuck = { version = "1", features = ["extern_crate_std"], optional = true }
+
+[features]
+default = []
+sender = ["cpal", "bytemuck"]
+
+[[bin]]
+name = "udp_sender"
+path = "src/bin/udp_sender.rs"
+required-features = ["sender"]
