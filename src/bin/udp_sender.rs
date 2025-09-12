@@ -1,11 +1,12 @@
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::VecDeque;
+// intentionally unused: no VecDeque usage remains
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use sound_send::rate::RollingRate;
 use sound_send::packet::{encode_packet, Meta};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,10 +138,10 @@ fn main() -> Result<()> {
     // --- 3. Main loop: receive chunks, send via UDP, print stats ---
     let mut total_bytes_sent: u64 = 0;
     let mut sequence_number: u64 = 0;
-    let mut history: VecDeque<(Instant, usize)> = VecDeque::new();
     let mut last_update_time = Instant::now();
     const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
-    const HISTORY_DURATION: Duration = Duration::from_secs(10);
+    const WINDOW: Duration = Duration::from_secs(10);
+    let mut byte_rate = RollingRate::new(WINDOW);
 
     println!("Sending started. Press Ctrl+C to stop.");
 
@@ -154,19 +155,10 @@ fn main() -> Result<()> {
         let now = Instant::now();
         let sent_packet_size = send_buf.len();
         total_bytes_sent += sent_packet_size as u64;
-        history.push_back((now, sent_packet_size));
+        byte_rate.record(now, sent_packet_size as u64);
 
         if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
-            while let Some((timestamp, _)) = history.front() {
-                if now.duration_since(*timestamp) > HISTORY_DURATION {
-                    history.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            let recent_bytes: usize = history.iter().map(|&(_, bytes)| bytes).sum();
-            let average_rate_bps = recent_bytes as f64 / HISTORY_DURATION.as_secs_f64();
+            let average_rate_bps = byte_rate.rate_per_sec(now);
 
             print!(
                 "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s   ",
