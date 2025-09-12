@@ -3,6 +3,8 @@ use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sound_send::rate::{RollingRate, RollingMean};
+use sound_send::sync::{decode as sync_decode, encode as sync_encode, SyncMessage};
+use sound_send::timesync::TimeSyncEstimator;
 use sound_send::packet::decode_packet;
 use std::process::{Command, Stdio};
 
@@ -66,6 +68,10 @@ fn main() -> io::Result<()> {
     let mut byte_rate = RollingRate::new(WINDOW);
     // Rolling latency mean (ms) over the last WINDOW
     let mut latency_mean = RollingMean::new(WINDOW);
+    // Time sync estimator (offset/drift)
+    let mut ts_est = TimeSyncEstimator::new(0.2, 0.2);
+    let mut last_sender: Option<std::net::SocketAddr> = None;
+    let mut last_ping_ms: u64 = 0;
 
     // Output sinks (stdout or PipeWire via pw-cat)
     let mut stdout = io::stdout().lock();
@@ -76,11 +82,28 @@ fn main() -> io::Result<()> {
         // Receive data; get byte count and source address
         let (bytes_received, src_addr) = socket.recv_from(&mut buf)?;
 
-        // Decode packet (magic, length, meta, sequence, payload)
+        // First, check for sync control message
+        if let Some(msg) = sync_decode(&buf[..bytes_received]) {
+            match msg {
+                SyncMessage::Pong { t0_ms, t1_ms, t2_ms } => {
+                    // t3 is now
+                    let t3_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_else(|_| Duration::from_millis(0))
+                        .as_millis() as u64;
+                    let _state = ts_est.update(t0_ms, t1_ms, t2_ms, t3_ms);
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Decode audio packet (magic, length, meta, sequence, payload)
         let decoded = match decode_packet(&buf[..bytes_received]) {
             Ok(d) => d,
             Err(_) => continue,
         };
+        last_sender = Some(src_addr);
         let received_sequence = decoded.seq;
         let payload = decoded.payload;
         let sent_ts_ms = decoded.timestamp_ms;
@@ -96,7 +119,10 @@ fn main() -> io::Result<()> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_millis(0))
             .as_millis() as u64;
-        let latency_ms = now_ms.saturating_sub(sent_ts_ms);
+        // Adjust latency by current offset estimate
+        let offset_ms = ts_est.state().offset_ms;
+        let adj_now_ms = (now_ms as i128 - offset_ms as i128).max(0) as u64;
+        let latency_ms = adj_now_ms.saturating_sub(sent_ts_ms);
         latency_mean.record(now_inst, latency_ms as f64);
 
         // Check packet loss/order; write payload only for in-order packets
@@ -157,6 +183,8 @@ fn main() -> io::Result<()> {
             let bytes_per_sec = byte_rate.rate_per_sec(now);
             let average_rate_kbs = bytes_per_sec / 1024.0;
             let avg_latency_ms = latency_mean.average(now);
+            let off = ts_est.state().offset_ms;
+            let drift = ts_est.state().drift_ppm;
 
             // Print stats in a single line (carriage return to overwrite)
             let total_expected_packets = expected_sequence;
@@ -168,7 +196,8 @@ fn main() -> io::Result<()> {
 
             eprint!(
                 "\rRecv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-                 Avg10s: {:.2} KB/s | Lat10s: {:.2} ms from {}   ",
+                 Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Off: {:+.2} ms | \
+                 Drift: {:+.1} ppm from {}   ",
                 total_packets_received,
                 lost_packets,
                 loss_percentage,
@@ -176,12 +205,27 @@ fn main() -> io::Result<()> {
                 total_bytes_received as f64 / (1024.0 * 1024.0),
                 average_rate_kbs,
                 avg_latency_ms,
+                off,
+                drift,
                 src_addr
             );
             // Flush to stderr immediately
             io::stderr().flush()?;
 
             last_update_time = now;
+            // Periodically send sync ping to the last sender
+            if let Some(addr) = last_sender {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_millis(0))
+                    .as_millis() as u64;
+                if now_ms.saturating_sub(last_ping_ms) >= 1_000 {
+                    let ping = SyncMessage::Ping { t0_ms: now_ms };
+                    let v = sync_encode(ping);
+                    let _ = socket.send_to(&v, addr);
+                    last_ping_ms = now_ms;
+                }
+            }
         }
     }
     // This loop is typically interrupted with Ctrl+C

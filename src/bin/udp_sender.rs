@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use sound_send::rate::RollingRate;
 use sound_send::packet::{encode_packet, Meta};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sound_send::sync::{decode as sync_decode, encode as sync_encode, SyncMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
@@ -135,6 +136,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // Spawn responder to handle time-sync pings from receiver
+    spawn_timesync_responder(&socket);
+
     // --- 3. Main loop: receive chunks, send via UDP, print stats ---
     let mut total_bytes_sent: u64 = 0;
     let mut sequence_number: u64 = 0;
@@ -230,4 +234,31 @@ fn print_usage() {
          -i, --input    Input source (default: cpal)\n\
          -h, --help     Show this help"
     );
+}
+
+fn spawn_timesync_responder(socket: &UdpSocket) {
+    let sock = socket
+        .try_clone()
+        .expect("failed to clone udp socket for timesync");
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 64];
+        match sock.recv_from(&mut buf) {
+            Ok((n, addr)) => {
+                if let Some(SyncMessage::Ping { t0_ms }) = sync_decode(&buf[..n]) {
+                    let t1 = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_else(|_| Duration::from_millis(0))
+                        .as_millis() as u64;
+                    let t2 = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_else(|_| Duration::from_millis(0))
+                        .as_millis() as u64;
+                    let pong = SyncMessage::Pong { t0_ms, t1_ms: t1, t2_ms: t2 };
+                    let v = sync_encode(pong);
+                    let _ = sock.send_to(&v, addr);
+                }
+            }
+            Err(_) => break,
+        }
+    });
 }
