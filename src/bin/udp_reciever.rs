@@ -2,6 +2,7 @@ use std::env;
 use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
+use sound_send::rate::RollingRate;
 use sound_send::packet::decode_packet;
 
 fn main() -> io::Result<()> {
@@ -30,9 +31,13 @@ fn main() -> io::Result<()> {
     let mut expected_sequence: u64 = 0;
     let mut lost_packets: u64 = 0;
     let mut out_of_order_packets: u64 = 0;
-    let start_time = Instant::now();
     let mut last_update_time = Instant::now();
     const UPDATE_INTERVAL: Duration = Duration::from_millis(200); // stats update interval (0.2s)
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    // Rolling rates over the last WINDOW
+    let mut pkt_rate = RollingRate::new(WINDOW);
+    let mut byte_rate = RollingRate::new(WINDOW);
 
     // Lock stdout for efficient writing
     let mut stdout = io::stdout().lock();
@@ -52,6 +57,11 @@ fn main() -> io::Result<()> {
 
         total_bytes_received += bytes_received as u64;
         total_packets_received += 1;
+
+        // Update rolling rates
+        let now_inst = Instant::now();
+        pkt_rate.record(now_inst, 1);
+        byte_rate.record(now_inst, payload.len() as u64);
 
         // Check packet loss/order; write payload only for in-order packets
         if received_sequence == expected_sequence {
@@ -73,13 +83,10 @@ fn main() -> io::Result<()> {
         // Update and print stats periodically
         let now = Instant::now();
         if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
-            // Compute elapsed time and average receive rate
-            let elapsed_time = start_time.elapsed().as_secs_f64();
-            let average_rate_kbs = if elapsed_time > 0.0 {
-                (total_bytes_received as f64 / 1024.0) / elapsed_time
-            } else {
-                0.0
-            };
+            // Rolling averages over the last WINDOW seconds
+            let pkt_per_sec = pkt_rate.rate_per_sec(now);
+            let bytes_per_sec = byte_rate.rate_per_sec(now);
+            let average_rate_kbs = bytes_per_sec / 1024.0;
 
             // Print stats in a single line (carriage return to overwrite)
             let total_expected_packets = expected_sequence;
@@ -91,13 +98,14 @@ fn main() -> io::Result<()> {
 
             eprint!(
                 "\rRecv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-                 Avg: {:.2} KB/s from {}   ",
+                 Avg10s: {:.2} KB/s | Pkts10s: {:.2}/s from {}   ",
                 total_packets_received,
                 lost_packets,
                 loss_percentage,
                 out_of_order_packets,
                 total_bytes_received as f64 / (1024.0 * 1024.0),
                 average_rate_kbs,
+                pkt_per_sec,
                 src_addr
             );
             // Flush to stderr immediately
