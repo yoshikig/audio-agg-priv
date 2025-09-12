@@ -7,6 +7,11 @@ pub struct TimeSyncState {
     pub drift_ppm: f64,
 }
 
+pub trait TimeSync {
+    fn update(&mut self, t0_ms: u64, t1_ms: u64, t2_ms: u64, t3_ms: u64) -> TimeSyncState;
+    fn state(&self) -> TimeSyncState;
+}
+
 #[derive(Debug)]
 pub struct TimeSyncEstimator {
     alpha: f64,
@@ -60,6 +65,13 @@ impl TimeSyncEstimator {
     pub fn state(&self) -> TimeSyncState { self.state }
 }
 
+impl TimeSync for TimeSyncEstimator {
+    fn update(&mut self, t0_ms: u64, t1_ms: u64, t2_ms: u64, t3_ms: u64) -> TimeSyncState {
+        TimeSyncEstimator::update(self, t0_ms, t1_ms, t2_ms, t3_ms)
+    }
+    fn state(&self) -> TimeSyncState { TimeSyncEstimator::state(self) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,4 +93,3 @@ mod tests {
         assert!(est.state().offset_ms > 0.0);
     }
 }
-

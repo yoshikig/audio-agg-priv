@@ -22,6 +22,7 @@ impl RollingRate {
         self.prune(now);
     }
 
+    #[cfg(test)]
     pub fn total_in_window(&mut self, now: Instant) -> u64 {
         self.prune(now);
         self.sum
