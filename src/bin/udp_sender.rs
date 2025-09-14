@@ -373,7 +373,6 @@ where
     // Cast &[T] -> &[u8] safely via bytemuck
     let err_fn = |err| eprintln!("input stream error: {err}");
 
-    let channels = config.channels as usize;
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _| {
@@ -391,7 +390,6 @@ where
                 }
                 offset = end;
             }
-            let _ = channels; // keep to show we considered channel count
         },
         err_fn,
         None,
