@@ -95,14 +95,63 @@ fn generate_cpal_stream(tx: &mpsc::Sender<Vec<u8>>) -> Result<(Stream, Meta)> {
 fn main() -> Result<()> {
     // --- 1. Parse args and set up socket ---
     let mut args = env::args().skip(1); // skip program name
-    let mut input_mode = InputMode::Cpal;
+    let mut input_mode = if cfg!(feature="cpal") {
+        InputMode::Cpal
+    } else {
+        InputMode::Stdin
+    };
     let mut server_addr: Option<String> = None;
+    // stdin metadata options
+    let mut opt_channels: Option<u8> = None;
+    let mut opt_sample_rate: Option<u32> = None;
+    let mut opt_format: Option<SampleFormat> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
+            }
+            "-c" | "--channels" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--channels requires a value"))?;
+                let n: u16 = val.parse().context("invalid --channels value")?;
+                if n == 0 || n > 255 { bail!("--channels must be 1..=255"); }
+                opt_channels = Some(n as u8);
+            }
+            _ if arg.starts_with("--channels=") => {
+                let val = &arg[11..];
+                let n: u16 = val.parse().context("invalid --channels value")?;
+                if n == 0 || n > 255 { bail!("--channels must be 1..=255"); }
+                opt_channels = Some(n as u8);
+            }
+            "-r" | "--rate" | "--sample-rate" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--rate requires a value (e.g., 48000)"))?;
+                let sr: u32 = val.parse().context("invalid --rate value")?;
+                opt_sample_rate = Some(sr);
+            }
+            _ if arg.starts_with("--rate=") => {
+                let val = &arg[7..];
+                let sr: u32 = val.parse().context("invalid --rate value")?;
+                opt_sample_rate = Some(sr);
+            }
+            _ if arg.starts_with("--sample-rate=") => {
+                let val = &arg[14..];
+                let sr: u32 = val.parse().context("invalid --sample-rate value")?;
+                opt_sample_rate = Some(sr);
+            }
+            "-f" | "--format" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--format requires a value (f32|i16|u16|u32)"))?;
+                opt_format = Some(parse_sample_format(&val)?);
+            }
+            _ if arg.starts_with("--format=") => {
+                let val = &arg[9..];
+                opt_format = Some(parse_sample_format(val)?);
             }
             "-i" | "--input" => {
                 let val = args
@@ -151,6 +200,9 @@ fn main() -> Result<()> {
         InputMode::Cpal => {
             # [cfg(feature="cpal")]
             {
+                if opt_channels.is_some() || opt_sample_rate.is_some() || opt_format.is_some() {
+                    bail!("--channels/--rate/--format are only valid with --input stdin");
+                }
                 let (stream, meta) = generate_cpal_stream(&tx)?;
                 packet_meta = meta;
                 _maybe_stream = Some(stream);
@@ -163,6 +215,10 @@ fn main() -> Result<()> {
         }
         InputMode::Stdin => {
             println!("Input: stdin (reading raw bytes)");
+            // Fill packet_meta from CLI flags with defaults if missing
+            packet_meta.channels = opt_channels.unwrap_or(2);
+            packet_meta.sample_rate = SampleRate(opt_sample_rate.unwrap_or(48_000));
+            packet_meta.sample_format = opt_format.unwrap_or(SampleFormat::U32);
             std::thread::spawn(move || {
                 let mut stdin = io::stdin().lock();
                 // Use a buffer that fits roughly within a UDP payload
@@ -228,6 +284,9 @@ fn main() -> Result<()> {
                 } else if packet_meta.sample_format == SampleFormat::U16 {
                     let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
                     guard.add_samples_u16(now, f);
+                } else if packet_meta.sample_format == SampleFormat::U32 {
+                    let f: &[u32] = bytemuck::cast_slice(&audio_chunk);
+                    guard.add_samples_u32(now, f);
                 }
             }
 
@@ -332,11 +391,27 @@ fn parse_input_mode(s: &str) -> Result<InputMode> {
     }
 }
 
+fn parse_sample_format(s: &str) -> Result<SampleFormat> {
+    match s.to_ascii_lowercase().as_str() {
+        "f32" => Ok(SampleFormat::F32),
+        "i16" => Ok(SampleFormat::I16),
+        "u16" => Ok(SampleFormat::U16),
+        "u32" => Ok(SampleFormat::U32),
+        other => bail!("invalid sample format: {} (expected: f32|i16|u16|u32)", other),
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage: udp_sender <server_addr:port> [--input <cpal|stdin>]\n\
-         -i, --input    Input source (default: cpal)\n\
-         -h, --help     Show this help"
+        "Usage: udp_sender <server_addr:port> [options]\n\
+         Required:\n\
+           <server_addr:port>          Destination address\n\
+         Options:\n\
+           -i, --input <cpal|stdin>    Input source (default: cpal)\n\
+           -c, --channels <1..255>     Channels for stdin (default: 2)\n\
+           -r, --rate <hz>             Sample rate for stdin (default: 48000)\n\
+           -f, --format <f32|i16|u16|u32>  Sample format for stdin (default: u32)\n\
+           -h, --help                  Show this help"
     );
 }
 

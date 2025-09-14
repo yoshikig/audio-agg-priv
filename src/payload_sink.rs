@@ -19,6 +19,7 @@ impl BinarySink {
             crate::packet::SampleFormat::F32 => "f32",
             crate::packet::SampleFormat::I16 => "s16",
             crate::packet::SampleFormat::U16 => "u16",
+            crate::packet::SampleFormat::U32 => "u32",
             _ => "f32",
         };
         let rate = meta.sample_rate.0.to_string();

@@ -26,6 +26,7 @@ pub enum SampleFormat {
     F32,
     I16,
     U16,
+    U32,
     Unknown,
 }
 

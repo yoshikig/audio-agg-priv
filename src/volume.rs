@@ -44,6 +44,19 @@ impl VolumeMeter {
         self.push(now, sum_sq, data.len());
     }
 
+    pub fn add_samples_u32(&mut self, now: Instant, data: &[u32]) {
+        let center = 2_147_483_648.0f64; // 2^31
+        let norm = 2_147_483_648.0f64;   // scale to approx [-1,1]
+        let sum_sq = data
+            .iter()
+            .map(|&v| {
+                let x = ((v as f64) - center) / norm;
+                x * x
+            })
+            .sum();
+        self.push(now, sum_sq, data.len());
+    }
+
     fn push(&mut self, now: Instant, sum_sq: f64, n: usize) {
         self.history.push_back((now, sum_sq, n));
         self.sum_sq += sum_sq;
@@ -73,4 +86,3 @@ impl VolumeMeter {
         if rms <= 0.0 { -120.0 } else { 20.0 * rms.log10() }
     }
 }
-

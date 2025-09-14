@@ -147,6 +147,13 @@ fn main() -> io::Result<()> {
                         }
                         ctx.stats.volume.add_samples_u16(now_inst, &v);
                     }
+                    sound_send::packet::SampleFormat::U32 => {
+                        let mut v = Vec::with_capacity(payload.len() / 4);
+                        for b in payload.chunks_exact(4) {
+                            v.push(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+                        }
+                        ctx.stats.volume.add_samples_u32(now_inst, &v);
+                    }
                     _ => {}
                 }
 

@@ -13,7 +13,7 @@ const PACKET_VERSION: u8 = 2;
 /// - 2 bytes: payload length (u16)
 /// - 1 byte : channels
 /// - 1 byte : sample rate code (enum, see `SampleRateCode`)
-/// - 1 byte : sample format code (1=F32, 2=I16, 3=U16, 0=unknown)
+/// - 1 byte : sample format code (1=F32, 2=I16, 3=U16, 4=U32, 0=unknown)
 /// - 1 byte : reserved (dummy)
 /// - 8 bytes: sequence number (u64)
 /// - 8 bytes: timestamp (u64, ms since UNIX epoch)
@@ -148,6 +148,7 @@ pub fn encode_packet(
         SampleFormat::F32 => 1,
         SampleFormat::I16 => 2,
         SampleFormat::U16 => 3,
+        SampleFormat::U32 => 4,
         _ => 0,
     };
     buf.push(sf_code);
@@ -189,6 +190,7 @@ pub fn decode_packet<'a>(data: &'a [u8]) -> Result<Decoded<'a>, DataPacketError>
         1 => SampleFormat::F32,
         2 => SampleFormat::I16,
         3 => SampleFormat::U16,
+        4 => SampleFormat::U32,
         _ => SampleFormat::F32, // default if unknown
     };
     Ok(Decoded { seq, timestamp_ms, meta: Meta { channels, sample_rate, sample_format }, payload })
