@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::env;
 use std::io::{self, Read};
 use std::net::UdpSocket;
@@ -8,15 +7,89 @@ use sound_send::rate::RollingRate;
 use sound_send::volume::VolumeMeter;
 use std::sync::{Arc, Mutex};
 use sound_send::packet::{encode_packet, Meta};
-use std::any::TypeId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sound_send::packet::{decode_message, encode_sync, respond_to_ping, Message, SyncMessage};
+use sound_send::packet::{decode_message, encode_sync, respond_to_ping, Message, SyncMessage, SampleFormat, SampleRate};
 use sound_send::send_stats::SendStats;
+use bytemuck;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
     Cpal,
     Stdin,
+}
+
+# [cfg(feature="cpal")]
+type Stream = cpal::Stream;
+# [cfg(not(feature="cpal"))]
+type Stream = ();
+
+# [cfg(feature="cpal")]
+fn generate_cpal_stream(tx: &mpsc::Sender<Vec<u8>>) -> Result<(Stream, Meta)> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    // Metadata to include in each packet
+    let mut packet_meta = Meta {
+        channels: 0,
+        sample_rate: SampleRate(0),
+        sample_format: SampleFormat::F32,
+    };
+
+    println!("Input: CPAL (default audio input)");
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .context("no default input device found")?;
+
+    let supported_config = device
+        .default_input_config()
+        .context("failed to get default input config")?;
+
+    let config = supported_config.config();
+    eprintln!("Device: {:?}", device.name().ok());
+    eprintln!(
+        "  Sample Format: {:?}\n  Sample Rate: {} Hz\n  Channels: {}",
+        supported_config.sample_format(),
+        config.sample_rate.0,
+        config.channels
+    );
+
+    // Build metadata (1 byte each)
+    packet_meta.channels = config.channels.min(255) as u8;
+    packet_meta.sample_rate = config.sample_rate.into();
+    packet_meta.sample_format = match supported_config.sample_format() {
+        cpal::SampleFormat::F32 => SampleFormat::F32,
+        cpal::SampleFormat::I16 => SampleFormat::I16,
+        cpal::SampleFormat::U16 => SampleFormat::U16,
+        _ => SampleFormat::Unknown,
+    };
+
+    let stream: cpal::Stream = match supported_config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            build_cpal_input_stream::<f32>(
+                &device,
+                &config,
+                tx.clone(),
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            build_cpal_input_stream::<i16>(
+                &device,
+                &config,
+                tx.clone(),
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            build_cpal_input_stream::<u16>(
+                &device,
+                &config,
+                tx.clone(),
+            )?
+        }
+        other => bail!("unsupported sample format: {:?}", other),
+    };
+    stream.play().context("failed to start input stream")?;
+
+    Ok((stream, packet_meta))
 }
 
 fn main() -> Result<()> {
@@ -67,68 +140,26 @@ fn main() -> Result<()> {
     let meter = Arc::new(Mutex::new(VolumeMeter::new(VOLUME_WINDOW)));
 
     // --- 2. Configure input source ---
-    let _maybe_stream; // keep stream alive when in CPAL mode
+    let _maybe_stream: Option<Stream>; // keep stream alive when in CPAL mode
     // Metadata to include in each packet
     let mut packet_meta = Meta {
         channels: 0,
-        sample_rate: cpal::SampleRate(0),
-        sample_format: cpal::SampleFormat::F32,
+        sample_rate: SampleRate(0),
+        sample_format: SampleFormat::F32,
     };
     match input_mode {
         InputMode::Cpal => {
-            println!("Input: CPAL (default audio input)");
-            let host = cpal::default_host();
-            let device = host
-                .default_input_device()
-                .context("no default input device found")?;
-
-            let supported_config = device
-                .default_input_config()
-                .context("failed to get default input config")?;
-
-            let config = supported_config.config();
-            eprintln!("Device: {:?}", device.name().ok());
-            eprintln!(
-                "  Sample Format: {:?}\n  Sample Rate: {} Hz\n  Channels: {}",
-                supported_config.sample_format(),
-                config.sample_rate.0,
-                config.channels
-            );
-
-            // Build metadata (1 byte each)
-            packet_meta.channels = config.channels.min(255) as u8;
-            packet_meta.sample_rate = config.sample_rate;
-            packet_meta.sample_format = supported_config.sample_format();
-
-            let stream: cpal::Stream = match supported_config.sample_format() {
-                cpal::SampleFormat::F32 => {
-                    build_input_stream::<f32>(
-                        &device,
-                        &config,
-                        tx.clone(),
-                        Some(meter.clone()),
-                    )?
-                }
-                cpal::SampleFormat::I16 => {
-                    build_input_stream::<i16>(
-                        &device,
-                        &config,
-                        tx.clone(),
-                        Some(meter.clone()),
-                    )?
-                }
-                cpal::SampleFormat::U16 => {
-                    build_input_stream::<u16>(
-                        &device,
-                        &config,
-                        tx.clone(),
-                        Some(meter.clone()),
-                    )?
-                }
-                other => bail!("unsupported sample format: {:?}", other),
-            };
-            stream.play().context("failed to start input stream")?;
-            _maybe_stream = Some(stream);
+            # [cfg(feature="cpal")]
+            {
+                let (stream, meta) = generate_cpal_stream(&tx)?;
+                packet_meta = meta;
+                _maybe_stream = Some(stream);
+            }
+            # [cfg(not(feature="cpal"))]
+            {
+                _maybe_stream = None;
+                bail!("CPAL feature not enabled in this build");
+            }
         }
         InputMode::Stdin => {
             println!("Input: stdin (reading raw bytes)");
@@ -185,6 +216,21 @@ fn main() -> Result<()> {
             let ts_ms = now_ts.as_millis() as u64;
             let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
 
+            {
+                let mut guard = meter.lock().unwrap();
+                let now = Instant::now();
+                if packet_meta.sample_format == SampleFormat::F32 {
+                    let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
+                    guard.add_samples_f32(now, f);
+                } else if packet_meta.sample_format == SampleFormat::I16 {
+                    let f: &[i16] = bytemuck::cast_slice(&audio_chunk);
+                    guard.add_samples_i16(now, f);
+                } else if packet_meta.sample_format == SampleFormat::U16 {
+                    let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
+                    guard.add_samples_u16(now, f);
+                }
+            }
+
             if send_sock
                 .send_to(&send_buf, &server_addr_cloned)
                 .is_err()
@@ -238,15 +284,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_input_stream<T>(
+# [cfg(feature="cpal")]
+fn build_cpal_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     tx: mpsc::Sender<Vec<u8>>,
-    meter: Option<Arc<Mutex<VolumeMeter>>>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::Sample + cpal::SizedSample + bytemuck::Pod + bytemuck::Zeroable,
 {
+    use cpal::traits::DeviceTrait;
+
     // Cast &[T] -> &[u8] safely via bytemuck
     let err_fn = |err| eprintln!("input stream error: {err}");
 
@@ -256,20 +304,6 @@ where
         move |data: &[T], _| {
             // Data is interleaved. Send in reasonably small chunks.
             // For now, split the current callback buffer into UDP-sized chunks.
-            if let Some(m) = &meter {
-                let mut guard = m.lock().unwrap();
-                let now = Instant::now();
-                if TypeId::of::<T>() == TypeId::of::<f32>() {
-                    let f: &[f32] = unsafe { &*(data as *const [T] as *const [f32]) };
-                    guard.add_samples_f32(now, f);
-                } else if TypeId::of::<T>() == TypeId::of::<i16>() {
-                    let f: &[i16] = unsafe { &*(data as *const [T] as *const [i16]) };
-                    guard.add_samples_i16(now, f);
-                } else if TypeId::of::<T>() == TypeId::of::<u16>() {
-                    let f: &[u16] = unsafe { &*(data as *const [T] as *const [u16]) };
-                    guard.add_samples_u16(now, f);
-                }
-            }
             let bytes: &[u8] = bytemuck::cast_slice(data);
             // Split to avoid exceeding typical MTU when adding our ~24-byte header
             const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)

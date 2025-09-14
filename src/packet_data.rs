@@ -1,24 +1,6 @@
-#[cfg(feature = "cpal")]
-pub use cpal::{SampleFormat, SampleRate};
+// src/packet_data.rs
 
-#[cfg(not(feature = "cpal"))]
-mod compat {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum SampleFormat {
-        F32,
-        I16,
-        U16,
-        Unknown,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct SampleRate(pub u32);
-}
-
-#[cfg(not(feature = "cpal"))]
-pub use compat::{SampleFormat, SampleRate};
-
-use crate::packet::DATA_PACKET_MAGIC;
+use crate::packet::{DATA_PACKET_MAGIC, SampleFormat, SampleRate};
 
 // IMPORTANT: Bump PACKET_VERSION whenever the on-wire packet header/layout changes.
 const PACKET_VERSION: u8 = 2;

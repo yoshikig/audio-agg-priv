@@ -1,7 +1,7 @@
 // Packet multiplexer: expose data and sync APIs and provide unified decode.
 
 pub use crate::packet_data::{
-    encode_packet, decode_packet, Meta, Decoded, SampleRateCode, SampleFormat, SampleRate,
+    encode_packet, decode_packet, Meta, Decoded, SampleRateCode,
     DataPacketError,
 };
 pub use crate::packet_sync::{
@@ -19,6 +19,31 @@ pub enum Message<'a> {
     Sync(SyncMessage),
     // Audio/data message (borrowed from input buffer)
     Data(Decoded<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFormat {
+    F32,
+    I16,
+    U16,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleRate(pub u32);
+
+# [cfg(feature="cpal")]
+impl Into<cpal::SampleRate> for SampleRate {
+    fn into(self) -> cpal::SampleRate {
+        cpal::SampleRate(self.0)
+    }
+}
+
+# [cfg(feature="cpal")]
+impl From<cpal::SampleRate> for SampleRate {
+    fn from(sr: cpal::SampleRate) -> Self {
+        SampleRate(sr.0)
+    }
 }
 
 /// Try to decode either a sync control message or an audio data message
