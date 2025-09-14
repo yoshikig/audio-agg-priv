@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0"
 cpal = { version = "0.15", optional = true }
 bytemuck = { version = "1", features = ["extern_crate_std"] }
+thread-priority = "3.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system_status_bar_macos = "0.1.3"

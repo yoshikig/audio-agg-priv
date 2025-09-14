@@ -1,0 +1,8 @@
+Destination: 10.0.11.81:50000
+Input: CPAL (default audio input)
+Device: Some("BlackHole 2ch")
+  Sample Format: F32
+  Sample Rate: 48000 Hz
+  Channels: 2
+Handshake complete: received Pong (attempt 1)
+Sending started.

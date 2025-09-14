@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sound_send::packet::{decode_message, encode_sync, respond_to_ping, Message, SyncMessage, SampleFormat, SampleRate};
 use sound_send::send_stats::SendStats;
 use bytemuck;
+use thread_priority::*;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
@@ -264,59 +266,62 @@ fn main() -> Result<()> {
     let server_addr_cloned = server_addr.clone();
 
     let meter_cloned = meter.clone();
-    std::thread::spawn(move || {
-        let mut total_bytes_sent: u64 = 0;
-        let mut sequence_number: u64 = 0;
-        let mut last_update_time = Instant::now();
-        let mut byte_rate = RollingRate::new(WINDOW);
+    let _thread = ThreadBuilder::default()
+        .name("AudioSender")
+        .priority(ThreadPriority::Max)
+        .spawn_careless(move || {
+            let mut total_bytes_sent: u64 = 0;
+            let mut sequence_number: u64 = 0;
+            let mut last_update_time = Instant::now();
+            let mut byte_rate = RollingRate::new(WINDOW);
 
-        for audio_chunk in rx {
-            let now_ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|_| Duration::from_millis(0));
-            let ts_ms = now_ts.as_millis() as u64;
-            let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
+            for audio_chunk in rx {
+                let now_ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_millis(0));
+                let ts_ms = now_ts.as_millis() as u64;
+                let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
 
-            {
-                let mut guard = meter_cloned.lock().unwrap();
-                let now = Instant::now();
-                if packet_meta.sample_format == SampleFormat::F32 {
-                    let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
-                    guard.add_samples_f32(now, f);
-                } else if packet_meta.sample_format == SampleFormat::I16 {
-                    let f: &[i16] = bytemuck::cast_slice(&audio_chunk);
-                    guard.add_samples_i16(now, f);
-                } else if packet_meta.sample_format == SampleFormat::U16 {
-                    let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
-                    guard.add_samples_u16(now, f);
-                } else if packet_meta.sample_format == SampleFormat::U32 {
-                    let f: &[u32] = bytemuck::cast_slice(&audio_chunk);
-                    guard.add_samples_u32(now, f);
+                if send_sock
+                    .send_to(&send_buf, &server_addr_cloned)
+                    .is_err()
+                {
+                    // Ignore send errors and continue
                 }
+
+                {
+                    let mut guard = meter_cloned.lock().unwrap();
+                    let now = Instant::now();
+                    if packet_meta.sample_format == SampleFormat::F32 {
+                        let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
+                        guard.add_samples_f32(now, f);
+                    } else if packet_meta.sample_format == SampleFormat::I16 {
+                        let f: &[i16] = bytemuck::cast_slice(&audio_chunk);
+                        guard.add_samples_i16(now, f);
+                    } else if packet_meta.sample_format == SampleFormat::U16 {
+                        let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
+                        guard.add_samples_u16(now, f);
+                    } else if packet_meta.sample_format == SampleFormat::U32 {
+                        let f: &[u32] = bytemuck::cast_slice(&audio_chunk);
+                        guard.add_samples_u32(now, f);
+                    }
+                }
+
+                let now = Instant::now();
+                let sent_packet_size = send_buf.len();
+                total_bytes_sent += sent_packet_size as u64;
+                byte_rate.record(now, sent_packet_size as u64);
+
+                if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
+                    let average_rate_bps = byte_rate.rate_per_sec(now);
+                    let _ = stats_tx.send(SendStats { total_bytes_sent, average_rate_bps });
+                    last_update_time = now;
+                }
+
+                sequence_number = sequence_number.wrapping_add(1);
             }
-
-            if send_sock
-                .send_to(&send_buf, &server_addr_cloned)
-                .is_err()
-            {
-                // Ignore send errors and continue
-            }
-
-            let now = Instant::now();
-            let sent_packet_size = send_buf.len();
-            total_bytes_sent += sent_packet_size as u64;
-            byte_rate.record(now, sent_packet_size as u64);
-
-            if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
-                let average_rate_bps = byte_rate.rate_per_sec(now);
-                let _ = stats_tx.send(SendStats { total_bytes_sent, average_rate_bps });
-                last_update_time = now;
-            }
-
-            sequence_number = sequence_number.wrapping_add(1);
-        }
-        // Drop the stats channel to signal completion
-        drop(stats_tx);
+            // Drop the stats channel to signal completion
+            drop(stats_tx);
     });
 
     // --- 4. Show status icon on macOS, or print stats on other OSes ---
