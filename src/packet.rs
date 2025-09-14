@@ -52,3 +52,17 @@ pub fn decode_message(data: &[u8]) -> Result<Message<'_>, DecodeError> {
         _ => Err(DecodeError::UnknownMagic),
     }
 }
+
+pub fn respond_to_ping(socket: &std::net::UdpSocket, src_addr: std::net::SocketAddr, t0_ms: u64) {
+    let t1 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_millis(0))
+        .as_millis() as u64;
+    let t2 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_millis(0))
+        .as_millis() as u64;
+    let pong = SyncMessage::Pong { t0_ms, t1_ms: t1, t2_ms: t2 };
+    let v = encode_sync(&pong);
+    let _ = socket.send_to(&v, src_addr);
+}

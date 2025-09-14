@@ -5,9 +5,12 @@ use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use sound_send::rate::RollingRate;
+use sound_send::volume::VolumeMeter;
+use std::sync::{Arc, Mutex};
 use sound_send::packet::{encode_packet, Meta};
+use std::any::TypeId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sound_send::packet::{decode_message, encode_sync, Message, SyncMessage};
+use sound_send::packet::{decode_message, encode_sync, respond_to_ping, Message, SyncMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
@@ -60,6 +63,7 @@ fn main() -> Result<()> {
 
     // Channel used to pass input chunks to the main thread
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let meter = Arc::new(Mutex::new(VolumeMeter::new(VOLUME_WINDOW)));
 
     // --- 2. Configure input source ---
     let _maybe_stream; // keep stream alive when in CPAL mode
@@ -97,13 +101,28 @@ fn main() -> Result<()> {
 
             let stream: cpal::Stream = match supported_config.sample_format() {
                 cpal::SampleFormat::F32 => {
-                    build_input_stream::<f32>(&device, &config, tx.clone())?
+                    build_input_stream::<f32>(
+                        &device,
+                        &config,
+                        tx.clone(),
+                        Some(meter.clone()),
+                    )?
                 }
                 cpal::SampleFormat::I16 => {
-                    build_input_stream::<i16>(&device, &config, tx.clone())?
+                    build_input_stream::<i16>(
+                        &device,
+                        &config,
+                        tx.clone(),
+                        Some(meter.clone()),
+                    )?
                 }
                 cpal::SampleFormat::U16 => {
-                    build_input_stream::<u16>(&device, &config, tx.clone())?
+                    build_input_stream::<u16>(
+                        &device,
+                        &config,
+                        tx.clone(),
+                        Some(meter.clone()),
+                    )?
                 }
                 other => bail!("unsupported sample format: {:?}", other),
             };
@@ -135,7 +154,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Spawn responder to handle time-sync pings from receiver
+    // Perform handshake: wait for a Pong reply before starting data send
+    wait_for_pong_handshake(&socket, &server_addr)?;
+
+    // Spawn responder to handle time-sync pings from receiver (after handshake)
     spawn_timesync_responder(&socket);
 
     // --- 3. Main loop: receive chunks, send via UDP, print stats ---
@@ -144,6 +166,7 @@ fn main() -> Result<()> {
     let mut last_update_time = Instant::now();
     const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
     const WINDOW: Duration = Duration::from_secs(10);
+    const VOLUME_WINDOW: Duration = Duration::from_secs(1);
     let mut byte_rate = RollingRate::new(WINDOW);
 
     println!("Sending started. Press Ctrl+C to stop.");
@@ -167,10 +190,12 @@ fn main() -> Result<()> {
         if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
             let average_rate_bps = byte_rate.rate_per_sec(now);
 
+            let db = meter.lock().unwrap().dbfs(now);
             print!(
-                "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s   ",
+                "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Vol1s: {:>6.1} dBFS   ",
                 total_bytes_sent as f64 / (1024.0 * 1024.0),
-                average_rate_bps / 1024.0
+                average_rate_bps / 1024.0,
+                db
             );
             io::stdout().flush()?;
             last_update_time = now;
@@ -186,6 +211,7 @@ fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     tx: mpsc::Sender<Vec<u8>>,
+    meter: Option<Arc<Mutex<VolumeMeter>>>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::Sample + cpal::SizedSample + bytemuck::Pod + bytemuck::Zeroable,
@@ -199,6 +225,20 @@ where
         move |data: &[T], _| {
             // Data is interleaved. Send in reasonably small chunks.
             // For now, split the current callback buffer into UDP-sized chunks.
+            if let Some(m) = &meter {
+                let mut guard = m.lock().unwrap();
+                let now = Instant::now();
+                if TypeId::of::<T>() == TypeId::of::<f32>() {
+                    let f: &[f32] = unsafe { &*(data as *const [T] as *const [f32]) };
+                    guard.add_samples_f32(now, f);
+                } else if TypeId::of::<T>() == TypeId::of::<i16>() {
+                    let f: &[i16] = unsafe { &*(data as *const [T] as *const [i16]) };
+                    guard.add_samples_i16(now, f);
+                } else if TypeId::of::<T>() == TypeId::of::<u16>() {
+                    let f: &[u16] = unsafe { &*(data as *const [T] as *const [u16]) };
+                    guard.add_samples_u16(now, f);
+                }
+            }
             let bytes: &[u8] = bytemuck::cast_slice(data);
             // Split to avoid exceeding typical MTU when adding our ~24-byte header
             const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
@@ -235,26 +275,66 @@ fn print_usage() {
     );
 }
 
+fn wait_for_pong_handshake(socket: &UdpSocket, server_addr: &str) -> Result<()> {
+    // Temporarily set a read timeout for handshake retries
+    let original_timeout = socket
+        .read_timeout()
+        .unwrap_or(None);
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    // Send Ping and wait for corresponding Pong
+    // Try a few times before giving up
+    const MAX_ATTEMPTS: usize = 20; // ~10 seconds total
+    for attempt in 1..=MAX_ATTEMPTS {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_millis(0))
+            .as_millis() as u64;
+        let ping = SyncMessage::Ping { t0_ms: now };
+        let v = encode_sync(&ping);
+        let _ = socket.send_to(&v, server_addr);
+
+        let mut buf = [0u8; 128];
+        match socket.recv_from(&mut buf) {
+            Ok((n, _addr)) => {
+                if let Ok(Message::Sync(SyncMessage::Pong { t0_ms, .. })) = decode_message(&buf[..n]) {
+                    if t0_ms == now {
+                        // Matched our ping; handshake complete
+                        println!("Handshake complete: received Pong (attempt {attempt})");
+                        // Restore timeout before returning
+                        socket.set_read_timeout(original_timeout)?;
+                        return Ok(());
+                    }
+                }
+                // Not a matching pong; continue trying within this attempt window
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timed out; try next attempt
+            }
+            Err(e) => {
+                // Unexpected error; restore timeout and propagate
+                socket.set_read_timeout(original_timeout)?;
+                return Err(e).context("handshake recv failed");
+            }
+        }
+    }
+
+    // Restore timeout before failing
+    socket.set_read_timeout(original_timeout)?;
+    bail!("failed to complete ping/pong handshake with receiver");
+}
+
 fn spawn_timesync_responder(socket: &UdpSocket) {
-    let sock = socket
+    let ts_sock = socket
         .try_clone()
         .expect("failed to clone udp socket for timesync");
+
     std::thread::spawn(move || loop {
         let mut buf = [0u8; 64];
-        match sock.recv_from(&mut buf) {
+        match ts_sock.recv_from(&mut buf) {
             Ok((n, addr)) => {
                 if let Ok(Message::Sync(SyncMessage::Ping { t0_ms })) = decode_message(&buf[..n]) {
-                    let t1 = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_else(|_| Duration::from_millis(0))
-                        .as_millis() as u64;
-                    let t2 = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_else(|_| Duration::from_millis(0))
-                        .as_millis() as u64;
-                    let pong = SyncMessage::Pong { t0_ms, t1_ms: t1, t2_ms: t2 };
-                    let v = encode_sync(&pong);
-                    let _ = sock.send_to(&v, addr);
+                    respond_to_ping(&ts_sock, addr, t0_ms);
                 }
             }
             Err(_) => break,

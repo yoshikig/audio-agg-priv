@@ -1,4 +1,4 @@
-use crate::packet::{encode_sync, SyncMessage};
+use crate::packet_sync::{encode_sync, SyncMessage};
 use crate::timesync::TimeSync;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

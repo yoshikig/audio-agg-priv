@@ -2,7 +2,7 @@ use std::env;
 use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
-use sound_send::packet::{decode_message, Message, SyncMessage};
+use sound_send::packet::{decode_message, respond_to_ping, SyncMessage, Message};
 use sound_send::payload_sink::BinarySink;
 use std::collections::HashMap;
 use sound_send::sync_controller::DefaultSyncController;
@@ -19,9 +19,11 @@ fn main() -> io::Result<()> {
     let prog = args.next().unwrap_or_else(|| "udp_reciever".into());
     let mut listen_addr: Option<String> = None;
     let mut use_pipewire = false;
+    let mut show_progress = false;
     for arg in args {
         match arg.as_str() {
             "--pipewire" => use_pipewire = true,
+            "--progress" => show_progress = true,
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: {} <listen_addr:port> [--pipewire]",
@@ -62,6 +64,8 @@ fn main() -> io::Result<()> {
     let mut buf = [0; 2048];
     const UPDATE_INTERVAL: Duration = Duration::from_millis(200); // stats update interval (0.2s)
     const WINDOW: Duration = Duration::from_secs(10);
+    const VOLUME_WINDOW: Duration = Duration::from_secs(1);
+
     // Per-client context: sink + stats + expected seq + last seen time
     struct ClientCtx {
         sink: BinarySink,
@@ -89,7 +93,7 @@ fn main() -> io::Result<()> {
             sink: BinarySink::new(use_pipewire),
             stats: RecvStats::new(
                 WINDOW,
-                UPDATE_INTERVAL,
+                VOLUME_WINDOW,
                 DefaultSyncController::with_default_estimator(0.2, 0.2, 1_000),
             ),
             expected_seq: 0,
@@ -102,18 +106,49 @@ fn main() -> io::Result<()> {
             Ok(Message::Sync(SyncMessage::Pong { t0_ms, t1_ms, t2_ms })) => {
                 ctx.stats.on_pong(t0_ms, t1_ms, t2_ms);
             }
-            Ok(Message::Sync(SyncMessage::Ping { .. })) => {
-                // Ignore pings on receiver side
+            Ok(Message::Sync(SyncMessage::Ping { t0_ms })) => {
+                respond_to_ping(&socket, src_addr, t0_ms);
             }
             Ok(Message::Data(decoded)) => {
                 let received_sequence = decoded.seq;
                 let payload = decoded.payload;
                 let sent_ts_ms = decoded.timestamp_ms;
 
-                // Update rolling byte rate and latency
+                // Update rolling byte rate, latency, and volume
                 let now_inst = Instant::now();
                 let latency_ms = ctx.stats.compute_latency_ms(sent_ts_ms);
-                ctx.stats.on_packet(bytes_received, payload.len(), latency_ms, now_inst);
+                ctx.stats.on_packet(
+                    bytes_received,
+                    payload.len(),
+                    latency_ms,
+                    now_inst,
+                );
+                match decoded.meta.sample_format {
+                    sound_send::packet::SampleFormat::F32 => {
+                        let samples: &[f32] = unsafe {
+                            std::slice::from_raw_parts(
+                                payload.as_ptr() as *const f32,
+                                payload.len() / 4,
+                            )
+                        };
+                        ctx.stats.volume.add_samples_f32(now_inst, samples);
+                    }
+                    sound_send::packet::SampleFormat::I16 => {
+                        let mut v = Vec::with_capacity(payload.len() / 2);
+                        for b in payload.chunks_exact(2) {
+                            v.push(i16::from_ne_bytes([b[0], b[1]]));
+                        }
+                        ctx.stats.volume.add_samples_i16(now_inst, &v);
+                    }
+                    sound_send::packet::SampleFormat::U16 => {
+                        let mut v = Vec::with_capacity(payload.len() / 2);
+                        for b in payload.chunks_exact(2) {
+                            v.push(u16::from_ne_bytes([b[0], b[1]]));
+                        }
+                        ctx.stats.volume.add_samples_u16(now_inst, &v);
+                    }
+                    _ => {}
+                }
 
                 // Check packet loss/order; write payload only for in-order packets
                 if received_sequence == ctx.expected_seq {
@@ -155,7 +190,7 @@ fn main() -> io::Result<()> {
             ctx.stats.maybe_ping(&socket);
         }
 
-        if now.duration_since(last_render) >= UPDATE_INTERVAL {
+        if show_progress && now.duration_since(last_render) >= UPDATE_INTERVAL {
             // Deterministic order by address
             let mut addrs: Vec<_> = clients.keys().cloned().collect();
             addrs.sort_by_key(|a| (a.ip().to_string(), a.port()));

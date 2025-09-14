@@ -3,6 +3,7 @@ mod packet_sync;
 pub mod packet;
 pub mod payload_sink;
 pub mod rate;
+pub mod volume;
 mod timesync;
 pub mod sync_controller;
 pub mod recv_stats;

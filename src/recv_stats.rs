@@ -1,5 +1,6 @@
 use crate::rate::{RollingMean, RollingRate};
 use crate::sync_controller::{DefaultSyncController, SyncController};
+use crate::volume::VolumeMeter;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -12,10 +13,11 @@ pub struct RecvStats {
     byte_rate: RollingRate,
     latency_mean: RollingMean,
     sync: DefaultSyncController,
+    pub volume: VolumeMeter,
 }
 
 impl RecvStats {
-    pub fn new(window: Duration, _update_interval: Duration, sync: DefaultSyncController) -> Self {
+    pub fn new(window: Duration, volume_window: Duration, sync: DefaultSyncController) -> Self {
         Self {
             total_bytes_received: 0,
             total_packets_received: 0,
@@ -24,6 +26,7 @@ impl RecvStats {
             byte_rate: RollingRate::new(window),
             latency_mean: RollingMean::new(window),
             sync,
+            volume: VolumeMeter::new(volume_window),
         }
     }
 
@@ -57,6 +60,7 @@ impl RecvStats {
         let bytes_per_sec = self.byte_rate.rate_per_sec(now);
         let average_rate_kbs = bytes_per_sec / 1024.0;
         let avg_latency_ms = self.latency_mean.average(now);
+        let db = self.volume.dbfs(now);
         let total_expected_packets = expected_sequence;
         let loss_percentage = if total_expected_packets > 0 {
             (self.lost_packets as f64 / total_expected_packets as f64) * 100.0
@@ -67,7 +71,8 @@ impl RecvStats {
 
         format!(
             "\r[{}] Recv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-             Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Off: {:+.2} ms | Drift: {:+.1} ppm   ",
+             Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Vol10s: {:>6.1} dBFS | \
+             Off: {:+.2} ms | Drift: {:+.1} ppm   ",
             src_addr,
             self.total_packets_received,
             self.lost_packets,
@@ -76,6 +81,7 @@ impl RecvStats {
             total_mb,
             average_rate_kbs,
             avg_latency_ms,
+            db,
             offset_ms,
             drift_ppm,
         )
