@@ -1,6 +1,5 @@
 use crate::rate::{RollingMean, RollingRate};
 use crate::sync_controller::{DefaultSyncController, SyncController};
-use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -10,29 +9,31 @@ pub struct RecvStats {
     total_packets_received: u64,
     lost_packets: u64,
     out_of_order_packets: u64,
-    last_update_time: Instant,
-    update_interval: Duration,
     byte_rate: RollingRate,
     latency_mean: RollingMean,
     sync: DefaultSyncController,
 }
 
 impl RecvStats {
-    pub fn new(window: Duration, update_interval: Duration, sync: DefaultSyncController) -> Self {
+    pub fn new(window: Duration, _update_interval: Duration, sync: DefaultSyncController) -> Self {
         Self {
             total_bytes_received: 0,
             total_packets_received: 0,
             lost_packets: 0,
             out_of_order_packets: 0,
-            last_update_time: Instant::now(),
-            update_interval,
             byte_rate: RollingRate::new(window),
             latency_mean: RollingMean::new(window),
             sync,
         }
     }
 
-    pub fn on_packet(&mut self, bytes_received: usize, payload_len: usize, latency_ms: f64, now: Instant) {
+    pub fn on_packet(
+        &mut self,
+        bytes_received: usize,
+        payload_len: usize,
+        latency_ms: f64,
+        now: Instant,
+    ) {
         self.total_bytes_received += bytes_received as u64;
         self.total_packets_received += 1;
         self.byte_rate.record(now, payload_len as u64);
@@ -44,29 +45,6 @@ impl RecvStats {
     }
 
     pub fn mark_out_of_order(&mut self) { self.out_of_order_packets += 1; }
-
-    pub fn maybe_print(
-        &mut self,
-        now: Instant,
-        expected_sequence: u64,
-        src_addr: &SocketAddr,
-    ) -> io::Result<bool> {
-        if now.duration_since(self.last_update_time) < self.update_interval {
-            return Ok(false);
-        }
-
-        let line = self.format_status_line(
-            now,
-            expected_sequence,
-            src_addr,
-            self.sync.offset_ms(),
-            self.sync.drift_ppm(),
-        );
-        eprint!("{}", line);
-        io::stderr().flush()?;
-        self.last_update_time = now;
-        Ok(true)
-    }
 
     pub fn format_status_line(
         &mut self,
@@ -88,9 +66,9 @@ impl RecvStats {
         let total_mb = self.total_bytes_received as f64 / (1024.0 * 1024.0);
 
         format!(
-            "\rRecv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-             Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Off: {:+.2} ms | \
-             Drift: {:+.1} ppm from {}   ",
+            "\r[{}] Recv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
+             Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Off: {:+.2} ms | Drift: {:+.1} ppm   ",
+            src_addr,
             self.total_packets_received,
             self.lost_packets,
             loss_percentage,
@@ -100,13 +78,23 @@ impl RecvStats {
             avg_latency_ms,
             offset_ms,
             drift_ppm,
-            src_addr
         )
     }
 
     // Lightweight wrappers to access sync controller from main
-    pub fn register_sender(&mut self, addr: SocketAddr) { self.sync.register_sender(addr); }
-    pub fn on_pong(&mut self, t0_ms: u64, t1_ms: u64, t2_ms: u64) { self.sync.on_pong(t0_ms, t1_ms, t2_ms); }
-    pub fn compute_latency_ms(&self, sent_ts_ms: u64) -> f64 { self.sync.compute_latency_ms(sent_ts_ms) }
-    pub fn maybe_send_ping(&mut self, sock: &UdpSocket) { self.sync.maybe_send_ping(sock) }
+    pub fn register_sender(&mut self, addr: SocketAddr) {
+        self.sync.register_sender(addr);
+    }
+    pub fn on_pong(&mut self, t0_ms: u64, t1_ms: u64, t2_ms: u64) {
+        self.sync.on_pong(t0_ms, t1_ms, t2_ms);
+    }
+    pub fn compute_latency_ms(&self, sent_ts_ms: u64) -> f64 {
+        self.sync.compute_latency_ms(sent_ts_ms)
+    }
+    pub fn maybe_ping(&mut self, sock: &UdpSocket) {
+        self.sync.maybe_send_ping(sock)
+    }
+
+    pub fn offset_ms(&self) -> f64 { self.sync.offset_ms() }
+    pub fn drift_ppm(&self) -> f64 { self.sync.drift_ppm() }
 }

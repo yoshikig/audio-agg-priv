@@ -20,6 +20,9 @@ pub use compat::{SampleFormat, SampleRate};
 
 use crate::packet::DATA_PACKET_MAGIC;
 
+// IMPORTANT: Bump PACKET_VERSION whenever the on-wire packet header/layout changes.
+const PACKET_VERSION: u8 = 2;
+
 /// Data packet format utilities (audio payloads).
 ///
 /// Packet layout (big-endian):
@@ -33,9 +36,6 @@ use crate::packet::DATA_PACKET_MAGIC;
 /// - 8 bytes: sequence number (u64)
 /// - 8 bytes: timestamp (u64, ms since UNIX epoch)
 /// - N bytes: payload
-
-// IMPORTANT: Bump PACKET_VERSION whenever the on-wire packet header/layout changes.
-const PACKET_VERSION: u8 = 2;
 const HEADER_LEN: usize = 2 + 2 + 1 + 1 + 1 + 1 + 8 + 8; // 24 bytes
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +220,11 @@ mod tests {
     fn encode_then_decode_roundtrip() {
         let seq = 1234567890123456789u64;
         let payload = b"hello world";
-        let meta = Meta { channels: 2, sample_rate: SampleRate(48_000), sample_format: SampleFormat::F32 };
+        let meta = Meta {
+            channels: 2,
+            sample_rate: SampleRate(48_000),
+            sample_format: SampleFormat::F32,
+        };
         let pkt = encode_packet(seq, payload, meta, 42);
         let d = decode_packet(&pkt).expect("decode ok");
         assert_eq!(d.seq, seq);
@@ -231,7 +235,11 @@ mod tests {
 
     #[test]
     fn enforces_length_and_magic_version() {
-        let meta = Meta { channels: 1, sample_rate: SampleRate(44_000), sample_format: SampleFormat::I16 };
+        let meta = Meta {
+            channels: 1,
+            sample_rate: SampleRate(44_000),
+            sample_format: SampleFormat::I16,
+        };
         let pkt = encode_packet(1, b"abc", meta, 0);
         let mut bad_magic = pkt.clone();
         bad_magic[0] = 0; // break magic

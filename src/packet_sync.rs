@@ -54,7 +54,7 @@ impl core::fmt::Display for SyncDecodeError {
 
 // Decode only sync messages; data messages are handled in packet.rs
 pub fn decode_sync(data: &[u8]) -> Result<SyncMessage, SyncDecodeError> {
-    if data.len() < 1 { return Err(SyncDecodeError::TooShort); }
+    if data.is_empty() { return Err(SyncDecodeError::TooShort); }
     if data[0] != SYNC_PACKET_MAGIC { return Err(SyncDecodeError::BadMagic); }
     if data.len() < 2 { return Err(SyncDecodeError::TooShort); }
     if data[1] != SYNC_VERSION { return Err(SyncDecodeError::BadVersion); }
@@ -87,7 +87,9 @@ pub fn decode_sync(data: &[u8]) -> Result<SyncMessage, SyncDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{decode_message, encode_packet, Meta, SampleFormat, SampleRate, Message, SyncMessage};
+    use crate::packet::{
+        decode_message, encode_packet, Meta, SampleFormat, SampleRate, Message, SyncMessage,
+    };
 
     #[test]
     fn roundtrip_ping() {
@@ -107,7 +109,11 @@ mod tests {
 
     #[test]
     fn decode_data_message_via_packet() {
-        let meta = Meta { channels: 2, sample_rate: SampleRate(48_000), sample_format: SampleFormat::F32 };
+        let meta = Meta {
+            channels: 2,
+            sample_rate: SampleRate(48_000),
+            sample_format: SampleFormat::F32,
+        };
         let pkt = encode_packet(1, b"xyz", meta, 42);
         let m = decode_message(&pkt).unwrap();
         match m {

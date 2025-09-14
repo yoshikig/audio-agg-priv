@@ -44,16 +44,30 @@ impl BinarySink {
                 let _ = self.teardown_child();
                 self.spawn_pw(meta)?;
             }
-            match self.pw_stdin.as_mut().unwrap().write_all(payload) {
+            match self
+                .pw_stdin
+                .as_mut()
+                .unwrap()
+                .write_all(payload)
+            {
                 Ok(()) => {}
                 Err(e) => {
                     // Try one restart on write failure (e.g., broken pipe), then retry once
                     let _ = self.teardown_child();
                     self.spawn_pw(meta)?;
-                    self.pw_stdin.as_mut().unwrap().write_all(payload).map_err(|e2| {
-                        // If retry also fails, return original error context
-                        io::Error::new(e2.kind(), format!("pipewire write failed after restart: {e}"))
-                    })?;
+                    self.pw_stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(payload)
+                        .map_err(|e2| {
+                            // If retry also fails, return original error context
+                            io::Error::new(
+                                e2.kind(),
+                                format!(
+                                    "pipewire write failed after restart: {e}"
+                                ),
+                            )
+                        })?;
                 }
             }
         } else {
@@ -64,7 +78,11 @@ impl BinarySink {
 
     fn meta_changed(&self, meta: &Meta) -> bool {
         match self.last_meta {
-            Some(m) => m.channels != meta.channels || m.sample_rate.0 != meta.sample_rate.0 || m.sample_format as u8 != meta.sample_format as u8,
+            Some(m) => {
+                m.channels != meta.channels
+                    || m.sample_rate.0 != meta.sample_rate.0
+                    || (m.sample_format as u8) != (meta.sample_format as u8)
+            }
             None => true,
         }
     }

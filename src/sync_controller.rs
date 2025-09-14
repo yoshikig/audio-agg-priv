@@ -3,7 +3,7 @@ use crate::timesync::TimeSync;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub trait SyncController {
+pub(crate) trait SyncController {
     fn register_sender(&mut self, addr: SocketAddr);
     fn on_pong(&mut self, t0_ms: u64, t1_ms: u64, t2_ms: u64);
     fn compute_latency_ms(&self, sent_ts_ms: u64) -> f64;
@@ -67,3 +67,4 @@ impl SyncController for DefaultSyncController {
         }
     }
 }
+
