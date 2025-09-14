@@ -101,6 +101,7 @@ fn main() -> Result<()> {
         InputMode::Stdin
     };
     let mut server_addr: Option<String> = None;
+    let mut show_status_icon = false;
     // stdin metadata options
     let mut opt_channels: Option<u8> = None;
     let mut opt_sample_rate: Option<u32> = None;
@@ -111,6 +112,9 @@ fn main() -> Result<()> {
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
+            }
+            "-s" | "--status-icon" => {
+                show_status_icon = true;
             }
             "-c" | "--channels" => {
                 let val = args
@@ -259,6 +263,7 @@ fn main() -> Result<()> {
         .context("failed to clone socket for sender thread")?;
     let server_addr_cloned = server_addr.clone();
 
+    let meter_cloned = meter.clone();
     std::thread::spawn(move || {
         let mut total_bytes_sent: u64 = 0;
         let mut sequence_number: u64 = 0;
@@ -273,7 +278,7 @@ fn main() -> Result<()> {
             let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
 
             {
-                let mut guard = meter.lock().unwrap();
+                let mut guard = meter_cloned.lock().unwrap();
                 let now = Instant::now();
                 if packet_meta.sample_format == SampleFormat::F32 {
                     let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
@@ -314,21 +319,27 @@ fn main() -> Result<()> {
         drop(stats_tx);
     });
 
-    #[cfg(target_os = "macos")]
-    {
-        println!("Sending started.");
-        sound_send::status_icon_mac::show_status_icon(stats_rx);
-    }
+    // --- 4. Show status icon on macOS, or print stats on other OSes ---
+    // On macOS, spawn a status icon in the main thread and let it run there
+    // On other OSes, print stats in the main thread
+    if show_status_icon {
+        #[cfg(target_os = "macos")]
+        {
+            println!("Sending started.");
+            sound_send::status_icon_mac::show_status_icon(stats_rx);
+        }
 
-    #[cfg(not(target_os = "macos"))]
-    {
+        if !cfg!(target_os = "macos") {
+            bail!("Status icon is only supported on macOS.");
+        }
+    } else {
         use std::io::Write;
 
         println!("Sending started. Press Ctrl+C to stop.");
 
         // Main thread: receive stats and render
         while let Ok(stats) = stats_rx.recv() {
-            let now = Instant::now();
+            let now: Instant = Instant::now();
             let db = meter.lock().unwrap().dbfs(now);
             print!(
                 "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Vol1s: {:>6.1} dBFS   ",
