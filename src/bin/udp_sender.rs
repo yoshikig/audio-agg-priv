@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::env;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use sound_send::rate::RollingRate;
@@ -11,6 +11,7 @@ use sound_send::packet::{encode_packet, Meta};
 use std::any::TypeId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sound_send::packet::{decode_message, encode_sync, respond_to_ping, Message, SyncMessage};
+use sound_send::send_stats::SendStats;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
@@ -160,48 +161,78 @@ fn main() -> Result<()> {
     // Spawn responder to handle time-sync pings from receiver (after handshake)
     spawn_timesync_responder(&socket);
 
-    // --- 3. Main loop: receive chunks, send via UDP, print stats ---
-    let mut total_bytes_sent: u64 = 0;
-    let mut sequence_number: u64 = 0;
-    let mut last_update_time = Instant::now();
+    // --- 3. Move sending to a worker thread; main prints stats ---
     const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
     const WINDOW: Duration = Duration::from_secs(10);
     const VOLUME_WINDOW: Duration = Duration::from_secs(1);
-    let mut byte_rate = RollingRate::new(WINDOW);
 
-    println!("Sending started. Press Ctrl+C to stop.");
+    let (stats_tx, stats_rx) = mpsc::channel::<SendStats>();
+    let send_sock = socket
+        .try_clone()
+        .context("failed to clone socket for sender thread")?;
+    let server_addr_cloned = server_addr.clone();
 
-    for audio_chunk in rx {
-        let now_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_millis(0));
-        let ts_ms = now_ts.as_millis() as u64;
-        let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
+    std::thread::spawn(move || {
+        let mut total_bytes_sent: u64 = 0;
+        let mut sequence_number: u64 = 0;
+        let mut last_update_time = Instant::now();
+        let mut byte_rate = RollingRate::new(WINDOW);
 
-        socket
-            .send_to(&send_buf, &server_addr)
-            .context("failed to send UDP packet")?;
+        for audio_chunk in rx {
+            let now_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| Duration::from_millis(0));
+            let ts_ms = now_ts.as_millis() as u64;
+            let send_buf = encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
 
-        let now = Instant::now();
-        let sent_packet_size = send_buf.len();
-        total_bytes_sent += sent_packet_size as u64;
-        byte_rate.record(now, sent_packet_size as u64);
+            if send_sock
+                .send_to(&send_buf, &server_addr_cloned)
+                .is_err()
+            {
+                // Ignore send errors and continue
+            }
 
-        if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
-            let average_rate_bps = byte_rate.rate_per_sec(now);
+            let now = Instant::now();
+            let sent_packet_size = send_buf.len();
+            total_bytes_sent += sent_packet_size as u64;
+            byte_rate.record(now, sent_packet_size as u64);
 
+            if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
+                let average_rate_bps = byte_rate.rate_per_sec(now);
+                let _ = stats_tx.send(SendStats { total_bytes_sent, average_rate_bps });
+                last_update_time = now;
+            }
+
+            sequence_number = sequence_number.wrapping_add(1);
+        }
+        // Drop the stats channel to signal completion
+        drop(stats_tx);
+    });
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("Sending started.");
+        sound_send::status_icon_mac::show_status_icon(stats_rx);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::io::Write;
+
+        println!("Sending started. Press Ctrl+C to stop.");
+
+        // Main thread: receive stats and render
+        while let Ok(stats) = stats_rx.recv() {
+            let now = Instant::now();
             let db = meter.lock().unwrap().dbfs(now);
             print!(
                 "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Vol1s: {:>6.1} dBFS   ",
-                total_bytes_sent as f64 / (1024.0 * 1024.0),
-                average_rate_bps / 1024.0,
+                stats.total_bytes_sent as f64 / (1024.0 * 1024.0),
+                stats.average_rate_bps / 1024.0,
                 db
             );
-            io::stdout().flush()?;
-            last_update_time = now;
+            let _ = io::stdout().flush();
         }
-
-        sequence_number = sequence_number.wrapping_add(1);
     }
 
     Ok(())
