@@ -252,6 +252,11 @@ fn main() -> Result<()> {
   // Perform handshake: wait for a Pong reply before starting data send
   wait_for_pong_handshake(&socket, &server_addr)?;
 
+  // Make socket nonblocking for send/recv after handshake
+  socket
+    .set_nonblocking(true)
+    .context("failed to set UDP socket nonblocking")?;
+
   // Spawn responder to handle time-sync pings from receiver (after handshake)
   spawn_timesync_responder(&socket);
 
@@ -556,6 +561,14 @@ fn spawn_timesync_responder(socket: &UdpSocket) {
         {
           respond_to_ping(&ts_sock, addr, t0_ms);
         }
+      }
+      Err(ref e)
+        if e.kind() == std::io::ErrorKind::WouldBlock
+          || e.kind() == std::io::ErrorKind::TimedOut =>
+      {
+        // Nonblocking poll; back off briefly
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        continue;
       }
       Err(_) => break,
     }
