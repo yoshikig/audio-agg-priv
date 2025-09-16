@@ -16,6 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thread_priority::*;
 
+const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
+                                       // Static asserts: ensure MAX_PAYLOAD aligns to all supported sample sizes
+const _: [(); MAX_PAYLOAD % 2] = [(); 0];
+const _: [(); MAX_PAYLOAD % 4] = [(); 0];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
   Cpal,
@@ -226,9 +231,6 @@ fn main() -> Result<()> {
       packet_meta.sample_format = opt_format.unwrap_or(SampleFormat::U32);
       std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
-        // Use a buffer that fits roughly within a UDP payload
-        // once the ~24B header is added
-        const MAX_PAYLOAD: usize = 1200;
         let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
           match stdin.read(&mut buf) {
@@ -273,6 +275,7 @@ fn main() -> Result<()> {
       let mut sequence_number: u64 = 0;
       let mut last_update_time = Instant::now();
       let mut byte_rate = RollingRate::new(WINDOW);
+      let mut warned_sample_align = false;
 
       for audio_chunk in rx {
         let now_ts = SystemTime::now()
@@ -289,18 +292,29 @@ fn main() -> Result<()> {
         {
           let mut guard = meter_cloned.lock().unwrap();
           let now = Instant::now();
-          if packet_meta.sample_format == SampleFormat::F32 {
-            let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
-            guard.add_samples_f32(now, f);
-          } else if packet_meta.sample_format == SampleFormat::I16 {
-            let f: &[i16] = bytemuck::cast_slice(&audio_chunk);
-            guard.add_samples_i16(now, f);
-          } else if packet_meta.sample_format == SampleFormat::U16 {
-            let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
-            guard.add_samples_u16(now, f);
-          } else if packet_meta.sample_format == SampleFormat::U32 {
-            let f: &[u32] = bytemuck::cast_slice(&audio_chunk);
-            guard.add_samples_u32(now, f);
+          let bps = bytes_per_sample(packet_meta.sample_format);
+          let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
+          if !aligned && !warned_sample_align {
+            eprintln!(
+              "warning: payload length {} is not a multiple of 1-sample ({} bytes)",
+              audio_chunk.len(), bps
+            );
+            warned_sample_align = true;
+          }
+          if aligned {
+            if packet_meta.sample_format == SampleFormat::F32 {
+              let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
+              guard.add_samples_f32(now, f);
+            } else if packet_meta.sample_format == SampleFormat::I16 {
+              let f: &[i16] = bytemuck::cast_slice(&audio_chunk);
+              guard.add_samples_i16(now, f);
+            } else if packet_meta.sample_format == SampleFormat::U16 {
+              let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
+              guard.add_samples_u16(now, f);
+            } else if packet_meta.sample_format == SampleFormat::U32 {
+              let f: &[u32] = bytemuck::cast_slice(&audio_chunk);
+              guard.add_samples_u32(now, f);
+            }
           }
         }
 
@@ -380,7 +394,6 @@ where
       // For now, split the current callback buffer into UDP-sized chunks.
       let bytes: &[u8] = bytemuck::cast_slice(data);
       // Split to avoid exceeding typical MTU when adding our ~24-byte header
-      const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
       let mut offset = 0;
       while offset < bytes.len() {
         let end = (offset + MAX_PAYLOAD).min(bytes.len());
@@ -415,6 +428,16 @@ fn parse_sample_format(s: &str) -> Result<SampleFormat> {
       "invalid sample format: {} (expected: f32|i16|u16|u32)",
       other
     ),
+  }
+}
+
+fn bytes_per_sample(fmt: SampleFormat) -> usize {
+  match fmt {
+    SampleFormat::F32 => 4,
+    SampleFormat::I16 => 2,
+    SampleFormat::U16 => 2,
+    SampleFormat::U32 => 4,
+    _ => 1,
   }
 }
 
