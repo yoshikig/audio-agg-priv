@@ -14,16 +14,21 @@ use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thread_priority::*;
 
 const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
                                        // Static asserts: ensure MAX_PAYLOAD aligns to all supported sample sizes
 const _: [(); MAX_PAYLOAD % 2] = [(); 0];
 const _: [(); MAX_PAYLOAD % 4] = [(); 0];
 
+const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
+const STATS_WINDOW: Duration = Duration::from_secs(10);
+const VOLUME_WINDOW: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
+  #[cfg(feature = "cpal")]
   Cpal,
+
   Stdin,
 }
 
@@ -33,8 +38,38 @@ type Stream = cpal::Stream;
 type Stream = ();
 
 #[cfg(feature = "cpal")]
-fn generate_cpal_stream(tx: &mpsc::Sender<Vec<u8>>) -> Result<(Stream, Meta)> {
-  use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+fn generate_cpal_stream(
+  device: &cpal::Device,
+  sample_format: SampleFormat,
+  process_chunk: impl FnMut(&[u8]) -> Result<()> + Send + 'static,
+) -> Result<Stream> {
+  use cpal::traits::{DeviceTrait, StreamTrait};
+
+  let supported_config = device
+    .default_input_config()
+    .context("failed to get default input config")?;
+  let config = supported_config.config();
+
+  let stream: cpal::Stream = match sample_format {
+    SampleFormat::F32 => {
+      build_cpal_input_stream::<f32>(&device, &config, process_chunk)?
+    }
+    SampleFormat::I16 => {
+      build_cpal_input_stream::<i16>(&device, &config, process_chunk)?
+    }
+    SampleFormat::U16 => {
+      build_cpal_input_stream::<u16>(&device, &config, process_chunk)?
+    }
+    other => bail!("unsupported sample format: {:?}", other),
+  };
+  stream.play().context("failed to start input stream")?;
+
+  Ok(stream)
+}
+
+#[cfg(feature = "cpal")]
+fn generate_cpal_meta(device: &cpal::Device) -> Result<Meta> {
+  use cpal::traits::DeviceTrait;
 
   // Metadata to include in each packet
   let mut packet_meta = Meta {
@@ -44,11 +79,6 @@ fn generate_cpal_stream(tx: &mpsc::Sender<Vec<u8>>) -> Result<(Stream, Meta)> {
   };
 
   println!("Input: CPAL (default audio input)");
-  let host = cpal::default_host();
-  let device = host
-    .default_input_device()
-    .context("no default input device found")?;
-
   let supported_config = device
     .default_input_config()
     .context("failed to get default input config")?;
@@ -72,32 +102,19 @@ fn generate_cpal_stream(tx: &mpsc::Sender<Vec<u8>>) -> Result<(Stream, Meta)> {
     _ => SampleFormat::Unknown,
   };
 
-  let stream: cpal::Stream = match supported_config.sample_format() {
-    cpal::SampleFormat::F32 => {
-      build_cpal_input_stream::<f32>(&device, &config, tx.clone())?
-    }
-    cpal::SampleFormat::I16 => {
-      build_cpal_input_stream::<i16>(&device, &config, tx.clone())?
-    }
-    cpal::SampleFormat::U16 => {
-      build_cpal_input_stream::<u16>(&device, &config, tx.clone())?
-    }
-    other => bail!("unsupported sample format: {:?}", other),
-  };
-  stream.play().context("failed to start input stream")?;
-
-  Ok((stream, packet_meta))
+  Ok(packet_meta)
 }
 
 fn main() -> Result<()> {
   // --- 1. Parse args and set up socket ---
   let mut args = env::args().skip(1); // skip program name
-  let mut input_mode = if cfg!(feature = "cpal") {
-    InputMode::Cpal
-  } else {
-    InputMode::Stdin
+  let mut input_mode : InputMode = {
+    #[cfg(feature = "cpal")]
+    { InputMode::Cpal }
+    #[cfg(not(feature = "cpal"))]
+    { InputMode::Stdin }
   };
-  let mut server_addr: Option<String> = None;
+    let mut server_addr: Option<String> = None;
   let mut show_status_icon = false;
   // stdin metadata options
   let mut opt_channels: Option<u8> = None;
@@ -180,6 +197,7 @@ fn main() -> Result<()> {
       }
     }
   }
+
   let server_addr = server_addr.ok_or_else(|| {
     anyhow::anyhow!(
       "missing destination. Usage: udp_sender <addr:port> [--input cpal|stdin]"
@@ -191,8 +209,6 @@ fn main() -> Result<()> {
     UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
   println!("Destination: {}", server_addr);
 
-  // Channel used to pass input chunks to the main thread
-  let (tx, rx) = mpsc::channel::<Vec<u8>>();
   let meter = Arc::new(Mutex::new(VolumeMeter::new(VOLUME_WINDOW)));
 
   // --- 2. Configure input source ---
@@ -203,25 +219,67 @@ fn main() -> Result<()> {
     sample_rate: SampleRate(0),
     sample_format: SampleFormat::F32,
   };
-  match input_mode {
+
+  // --- 3. Move sending to a worker thread; main prints stats ---
+  let (stats_tx, stats_rx) = mpsc::channel::<SendStats>();
+  let send_sock = socket
+    .try_clone()
+    .context("failed to clone socket for sender thread")?;
+
+  #[cfg(feature = "cpal")]
+  let device = match input_mode {
     InputMode::Cpal => {
-      #[cfg(feature = "cpal")]
-      {
-        if opt_channels.is_some()
+      use cpal::traits::HostTrait;
+
+      let host = cpal::default_host();
+      let device = host
+          .default_input_device()
+          .context("no default input device found")?;
+      Some(device)
+    }
+    _ => None,
+  };
+
+  match input_mode {
+    #[cfg(feature = "cpal")]
+    InputMode::Cpal => {
+      if opt_channels.is_some()
           || opt_sample_rate.is_some()
           || opt_format.is_some()
-        {
-          bail!("--channels/--rate/--format are only valid with --input stdin");
-        }
-        let (stream, meta) = generate_cpal_stream(&tx)?;
-        packet_meta = meta;
-        _maybe_stream = Some(stream);
-      }
-      #[cfg(not(feature = "cpal"))]
       {
-        _maybe_stream = None;
-        bail!("CPAL feature not enabled in this build");
+          bail!("--channels/--rate/--format are only valid with --input stdin");
       }
+
+      packet_meta = generate_cpal_meta(device.as_ref().unwrap())?;
+    }
+    InputMode::Stdin => {
+      println!("Input: stdin (reading raw bytes)");
+      // Fill packet_meta from CLI flags with defaults if missing
+      packet_meta.channels = opt_channels.unwrap_or(2);
+      packet_meta.sample_rate = SampleRate(opt_sample_rate.unwrap_or(48_000));
+      packet_meta.sample_format = opt_format.unwrap_or(SampleFormat::U32);
+    }
+  }
+
+  let mut worker: SendWorker = SendWorker::new(
+    send_sock,
+    server_addr.clone(),
+    packet_meta,
+    meter.clone(),
+    stats_tx,
+    STATS_WINDOW,
+    UPDATE_INTERVAL,
+  );
+
+  let mut process_chunk = move |audio_chunk: &[u8]| -> Result<()> {
+    worker.process_chunk(audio_chunk)
+  };
+
+  match input_mode {
+    #[cfg(feature = "cpal")]
+    InputMode::Cpal => {
+      let stream = generate_cpal_stream(device.as_ref().unwrap(), packet_meta.sample_format, process_chunk)?;
+      _maybe_stream = Some(stream);
     }
     InputMode::Stdin => {
       println!("Input: stdin (reading raw bytes)");
@@ -237,7 +295,7 @@ fn main() -> Result<()> {
             Ok(0) => break, // EOF
             Ok(n) => {
               // Send exactly the bytes read
-              if tx.send(buf[..n].to_vec()).is_err() {
+              if process_chunk(&buf[..n]).is_err() {
                 break;
               }
             }
@@ -252,102 +310,13 @@ fn main() -> Result<()> {
   // Perform handshake: wait for a Pong reply before starting data send
   wait_for_pong_handshake(&socket, &server_addr)?;
 
+  // Spawn responder to handle time-sync pings from receiver (after handshake)
+  spawn_timesync_responder(&socket);
+
   // Make socket nonblocking for send/recv after handshake
   socket
     .set_nonblocking(true)
     .context("failed to set UDP socket nonblocking")?;
-
-  // Spawn responder to handle time-sync pings from receiver (after handshake)
-  spawn_timesync_responder(&socket);
-
-  // --- 3. Move sending to a worker thread; main prints stats ---
-  const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
-  const WINDOW: Duration = Duration::from_secs(10);
-  const VOLUME_WINDOW: Duration = Duration::from_secs(1);
-
-  let (stats_tx, stats_rx) = mpsc::channel::<SendStats>();
-  let send_sock = socket
-    .try_clone()
-    .context("failed to clone socket for sender thread")?;
-  let server_addr_cloned = server_addr.clone();
-
-  let meter_cloned = meter.clone();
-  let _thread = ThreadBuilder::default()
-    .name("AudioSender")
-    .priority(ThreadPriority::Max)
-    .spawn_careless(move || {
-      let mut total_bytes_sent: u64 = 0;
-      let mut sequence_number: u64 = 0;
-      let mut last_update_time = Instant::now();
-      let mut byte_rate = RollingRate::new(WINDOW);
-      let mut warned_sample_align = false;
-
-      let mut prev_silent = false;
-      for audio_chunk in rx {
-        let now_ts = SystemTime::now()
-          .duration_since(UNIX_EPOCH)
-          .unwrap_or_else(|_| Duration::from_millis(0));
-        let ts_ms = now_ts.as_millis() as u64;
-        // Determine if this chunk is silence and collapse repeated silence
-        let bps = bytes_per_sample(packet_meta.sample_format);
-        let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
-        let is_silent = aligned && is_silent_chunk(packet_meta.sample_format, &audio_chunk);
-        let payload: &[u8] = if is_silent && prev_silent { &[] } else { &audio_chunk };
-        let send_buf = encode_packet(sequence_number, payload, packet_meta, ts_ms);
-        prev_silent = is_silent;
-
-        if send_sock.send_to(&send_buf, &server_addr_cloned).is_err() {
-          // Ignore send errors and continue
-        }
-
-        {
-          let mut guard = meter_cloned.lock().unwrap();
-          let now = Instant::now();
-          let bps = bytes_per_sample(packet_meta.sample_format);
-          let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
-          if !aligned && !warned_sample_align {
-            eprintln!(
-              "warning: payload length {} is not a multiple of 1-sample ({} bytes)",
-              audio_chunk.len(), bps
-            );
-            warned_sample_align = true;
-          }
-          if aligned {
-            if packet_meta.sample_format == SampleFormat::F32 {
-              let f: &[f32] = bytemuck::cast_slice(&audio_chunk);
-              guard.add_samples_f32(now, f);
-            } else if packet_meta.sample_format == SampleFormat::I16 {
-              let f: &[i16] = bytemuck::cast_slice(&audio_chunk);
-              guard.add_samples_i16(now, f);
-            } else if packet_meta.sample_format == SampleFormat::U16 {
-              let f: &[u16] = bytemuck::cast_slice(&audio_chunk);
-              guard.add_samples_u16(now, f);
-            } else if packet_meta.sample_format == SampleFormat::U32 {
-              let f: &[u32] = bytemuck::cast_slice(&audio_chunk);
-              guard.add_samples_u32(now, f);
-            }
-          }
-        }
-
-        let now = Instant::now();
-        let sent_packet_size = send_buf.len();
-        total_bytes_sent += sent_packet_size as u64;
-        byte_rate.record(now, sent_packet_size as u64);
-
-        if now.duration_since(last_update_time) >= UPDATE_INTERVAL {
-          let average_rate_bps = byte_rate.rate_per_sec(now);
-          let _ = stats_tx.send(SendStats {
-            total_bytes_sent,
-            average_rate_bps,
-          });
-          last_update_time = now;
-        }
-
-        sequence_number = sequence_number.wrapping_add(1);
-      }
-      // Drop the stats channel to signal completion
-      drop(stats_tx);
-    });
 
   // --- 4. Show status icon on macOS, or print stats on other OSes ---
   // On macOS, spawn a status icon in the main thread and let it run there
@@ -388,7 +357,7 @@ fn main() -> Result<()> {
 fn build_cpal_input_stream<T>(
   device: &cpal::Device,
   config: &cpal::StreamConfig,
-  tx: mpsc::Sender<Vec<u8>>,
+  mut process_chunk: impl FnMut(&[u8]) -> Result<()> + Send + 'static,
 ) -> Result<cpal::Stream>
 where
   T: cpal::Sample + cpal::SizedSample + bytemuck::Pod + bytemuck::Zeroable,
@@ -409,9 +378,7 @@ where
       while offset < bytes.len() {
         let end = (offset + MAX_PAYLOAD).min(bytes.len());
         let chunk = &bytes[offset..end];
-        if tx.send(chunk.to_vec()).is_err() {
-          break;
-        }
+        if process_chunk(chunk).is_err() { break; }
         offset = end;
       }
     },
@@ -423,9 +390,13 @@ where
 
 fn parse_input_mode(s: &str) -> Result<InputMode> {
   match s.to_ascii_lowercase().as_str() {
+    #[cfg(feature = "cpal")]
     "cpal" => Ok(InputMode::Cpal),
     "stdin" => Ok(InputMode::Stdin),
+    #[cfg(feature = "cpal")]
     _ => bail!("invalid input mode: {} (expected: cpal|stdin)", s),
+    #[cfg(not(feature = "cpal"))]
+    _ => bail!("invalid input mode: {} (expected: stdin)", s),
   }
 }
 
@@ -475,6 +446,117 @@ fn is_silent_chunk(fmt: SampleFormat, data: &[u8]) -> bool {
       s.iter().all(|&v| v == 0x8000_0000)
     }
     _ => false,
+  }
+}
+
+struct SendWorker {
+  send_sock: UdpSocket,
+  server_addr: String,
+  packet_meta: Meta,
+  meter: Arc<Mutex<VolumeMeter>>,
+  stats_tx: mpsc::Sender<SendStats>,
+  total_bytes_sent: u64,
+  sequence_number: u64,
+  last_update_time: Instant,
+  byte_rate: RollingRate,
+  warned_sample_align: bool,
+  prev_silent: bool,
+  update_interval: Duration,
+}
+
+impl SendWorker {
+  fn new(
+    send_sock: UdpSocket,
+    server_addr: String,
+    packet_meta: Meta,
+    meter: Arc<Mutex<VolumeMeter>>,
+    stats_tx: mpsc::Sender<SendStats>,
+    window: Duration,
+    update_interval: Duration,
+  ) -> Self {
+    Self {
+      send_sock,
+      server_addr,
+      packet_meta,
+      meter,
+      stats_tx,
+      total_bytes_sent: 0,
+      sequence_number: 0,
+      last_update_time: Instant::now(),
+      byte_rate: RollingRate::new(window),
+      warned_sample_align: false,
+      prev_silent: false,
+      update_interval,
+    }
+  }
+
+  fn process_chunk(&mut self, audio_chunk: &[u8]) -> Result<()> {
+    let now_ts = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_else(|_| Duration::from_millis(0));
+    let ts_ms = now_ts.as_millis() as u64;
+    // Determine if this chunk is silence and collapse repeated silence
+    let bps = bytes_per_sample(self.packet_meta.sample_format);
+    let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
+    let is_silent = aligned && is_silent_chunk(self.packet_meta.sample_format, audio_chunk);
+    let payload: &[u8] = if is_silent && self.prev_silent { &[] } else { audio_chunk };
+    let send_buf = encode_packet(self.sequence_number, payload, self.packet_meta, ts_ms);
+    self.prev_silent = is_silent;
+
+    if self
+      .send_sock
+      .send_to(&send_buf, &self.server_addr)
+      .is_err()
+    {
+      // Ignore send errors and continue (nonblocking)
+    }
+
+    {
+      let mut guard = self.meter.lock().unwrap();
+      let now = Instant::now();
+      let bps = bytes_per_sample(self.packet_meta.sample_format);
+      let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
+      if !aligned && !self.warned_sample_align {
+        eprintln!(
+          "warning: payload length {} is not a multiple of 1-sample ({} bytes)",
+          audio_chunk.len(), bps
+        );
+        self.warned_sample_align = true;
+      }
+      if aligned {
+        if self.packet_meta.sample_format == SampleFormat::F32 {
+          let f: &[f32] = bytemuck::cast_slice(audio_chunk);
+          guard.add_samples_f32(now, f);
+        } else if self.packet_meta.sample_format == SampleFormat::I16 {
+          let f: &[i16] = bytemuck::cast_slice(audio_chunk);
+          guard.add_samples_i16(now, f);
+        } else if self.packet_meta.sample_format == SampleFormat::U16 {
+          let f: &[u16] = bytemuck::cast_slice(audio_chunk);
+          guard.add_samples_u16(now, f);
+        } else if self.packet_meta.sample_format == SampleFormat::U32 {
+          let f: &[u32] = bytemuck::cast_slice(audio_chunk);
+          guard.add_samples_u32(now, f);
+        }
+      }
+    }
+
+    let now = Instant::now();
+    let sent_packet_size = send_buf.len();
+    self.total_bytes_sent += sent_packet_size as u64;
+    self.byte_rate.record(now, sent_packet_size as u64);
+
+    if now.duration_since(self.last_update_time) >= self.update_interval {
+      let average_rate_bps = self.byte_rate.rate_per_sec(now);
+      let _ = self.stats_tx.send(SendStats {
+        total_bytes_sent: self.total_bytes_sent,
+        average_rate_bps,
+      });
+      self.last_update_time = now;
+    }
+
+    self.sequence_number = self.sequence_number.wrapping_add(1);
+
+    Ok(())
   }
 }
 
