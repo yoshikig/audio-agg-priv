@@ -277,13 +277,19 @@ fn main() -> Result<()> {
       let mut byte_rate = RollingRate::new(WINDOW);
       let mut warned_sample_align = false;
 
+      let mut prev_silent = false;
       for audio_chunk in rx {
         let now_ts = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .unwrap_or_else(|_| Duration::from_millis(0));
         let ts_ms = now_ts.as_millis() as u64;
-        let send_buf =
-          encode_packet(sequence_number, &audio_chunk, packet_meta, ts_ms);
+        // Determine if this chunk is silence and collapse repeated silence
+        let bps = bytes_per_sample(packet_meta.sample_format);
+        let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
+        let is_silent = aligned && is_silent_chunk(packet_meta.sample_format, &audio_chunk);
+        let payload: &[u8] = if is_silent && prev_silent { &[] } else { &audio_chunk };
+        let send_buf = encode_packet(sequence_number, payload, packet_meta, ts_ms);
+        prev_silent = is_silent;
 
         if send_sock.send_to(&send_buf, &server_addr_cloned).is_err() {
           // Ignore send errors and continue
@@ -438,6 +444,32 @@ fn bytes_per_sample(fmt: SampleFormat) -> usize {
     SampleFormat::U16 => 2,
     SampleFormat::U32 => 4,
     _ => 1,
+  }
+}
+
+fn is_silent_chunk(fmt: SampleFormat, data: &[u8]) -> bool {
+  match fmt {
+    SampleFormat::F32 => {
+      if data.len() % 4 != 0 { return false; }
+      let s: &[f32] = bytemuck::cast_slice(data);
+      s.iter().all(|&v| v == 0.0)
+    }
+    SampleFormat::I16 => {
+      if data.len() % 2 != 0 { return false; }
+      let s: &[i16] = bytemuck::cast_slice(data);
+      s.iter().all(|&v| v == 0)
+    }
+    SampleFormat::U16 => {
+      if data.len() % 2 != 0 { return false; }
+      let s: &[u16] = bytemuck::cast_slice(data);
+      s.iter().all(|&v| v == 0x8000)
+    }
+    SampleFormat::U32 => {
+      if data.len() % 4 != 0 { return false; }
+      let s: &[u32] = bytemuck::cast_slice(data);
+      s.iter().all(|&v| v == 0x8000_0000)
+    }
+    _ => false,
   }
 }
 
