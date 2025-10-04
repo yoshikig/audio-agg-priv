@@ -7,5 +7,5 @@ is_mac () {
 
 set -euxo pipefail
 
-rustup component add rustfmt
+rustup +nightly component add rustfmt
 rustup component add clippy
