@@ -1,9 +1,11 @@
-# Tell Cargo to use the cross-compilation linker for the aarch64 target.
+# Linkers for non-native Linux targets are routed through small wrapper scripts
+# so native builds on Linux use the system linker while macOS keeps using the
+# cross toolchains.
 [target.aarch64-unknown-linux-gnu]
-linker = "aarch64-unknown-linux-gnu-gcc"
+linker = "scripts/linkers/aarch64-unknown-linux-gnu.sh"
 
 [target.x86_64-unknown-linux-gnu]
-linker = "x86_64-unknown-linux-gnu-gcc"
+linker = "scripts/linkers/x86_64-unknown-linux-gnu.sh"
 
 [target.x86_64-pc-windows-gnullvm]
 linker = "x86_64-w64-mingw32-gcc"
