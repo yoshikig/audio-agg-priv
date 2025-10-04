@@ -15,6 +15,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install check dependencies
+        run: |
+          ./scripts/install_check_dependencies.sh
+
       - name: Run check script
         run: ./scripts/run_check.sh
 
