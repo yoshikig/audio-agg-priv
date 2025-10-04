@@ -29,6 +29,9 @@ enum InputMode {
   #[cfg(feature = "cpal")]
   Cpal,
 
+  #[cfg(target_os = "windows")]
+  WasapiLoopback,
+
   Stdin,
 }
 
@@ -36,6 +39,41 @@ enum InputMode {
 type Stream = cpal::Stream;
 #[cfg(not(feature = "cpal"))]
 type Stream = ();
+
+#[cfg(target_os = "windows")]
+fn boost_current_thread_priority() {
+  use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+  };
+
+  unsafe {
+    if let Err(err) =
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+    {
+      eprintln!("warning: failed to raise thread priority: {err}");
+    }
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn boost_current_thread_priority() {}
+
+#[cfg(target_os = "windows")]
+fn boost_process_priority() {
+  use windows::Win32::System::Threading::{
+    GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
+  };
+
+  unsafe {
+    if let Err(err) = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)
+    {
+      eprintln!("warning: failed to raise process priority: {err}");
+    }
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn boost_process_priority() {}
 
 #[cfg(feature = "cpal")]
 fn generate_cpal_stream(
@@ -108,13 +146,23 @@ fn generate_cpal_meta(device: &cpal::Device) -> Result<Meta> {
 fn main() -> Result<()> {
   // --- 1. Parse args and set up socket ---
   let mut args = env::args().skip(1); // skip program name
-  let mut input_mode : InputMode = {
+  boost_process_priority();
+  #[allow(unused_mut)]
+  let mut input_mode: InputMode = {
     #[cfg(feature = "cpal")]
-    { InputMode::Cpal }
-    #[cfg(not(feature = "cpal"))]
-    { InputMode::Stdin }
+    {
+      InputMode::Cpal
+    }
+    #[cfg(all(not(feature = "cpal"), target_os = "windows"))]
+    {
+      InputMode::WasapiLoopback
+    }
+    #[cfg(all(not(feature = "cpal"), not(target_os = "windows")))]
+    {
+      InputMode::Stdin
+    }
   };
-    let mut server_addr: Option<String> = None;
+  let mut server_addr: Option<String> = None;
   let mut show_status_icon = false;
   // stdin metadata options
   let mut opt_channels: Option<u8> = None;
@@ -220,6 +268,9 @@ fn main() -> Result<()> {
     sample_format: SampleFormat::F32,
   };
 
+  #[cfg(target_os = "windows")]
+  let mut wasapi_config: Option<wasapi_loopback::LoopbackConfig> = None;
+
   // --- 3. Move sending to a worker thread; main prints stats ---
   let (stats_tx, stats_rx) = mpsc::channel::<SendStats>();
   let send_sock = socket
@@ -244,16 +295,28 @@ fn main() -> Result<()> {
     #[cfg(feature = "cpal")]
     InputMode::Cpal => {
       if opt_channels.is_some()
-          || opt_sample_rate.is_some()
-          || opt_format.is_some()
+        || opt_sample_rate.is_some()
+        || opt_format.is_some()
       {
-          bail!("--channels/--rate/--format are only valid with --input stdin");
+        bail!("--channels/--rate/--format are only valid with --input stdin");
       }
 
       packet_meta = generate_cpal_meta(device.as_ref().unwrap())?;
     }
+    #[cfg(target_os = "windows")]
+    InputMode::WasapiLoopback => {
+      if opt_channels.is_some()
+        || opt_sample_rate.is_some()
+        || opt_format.is_some()
+      {
+        bail!("--channels/--rate/--format are only valid with --input stdin");
+      }
+
+      let (meta, config) = wasapi_loopback::prepare_loopback()?;
+      packet_meta = meta;
+      wasapi_config = Some(config);
+    }
     InputMode::Stdin => {
-      println!("Input: stdin (reading raw bytes)");
       // Fill packet_meta from CLI flags with defaults if missing
       packet_meta.channels = opt_channels.unwrap_or(2);
       packet_meta.sample_rate = SampleRate(opt_sample_rate.unwrap_or(48_000));
@@ -281,6 +344,18 @@ fn main() -> Result<()> {
       let stream = generate_cpal_stream(device.as_ref().unwrap(), packet_meta.sample_format, process_chunk)?;
       _maybe_stream = Some(stream);
     }
+
+    #[cfg(target_os = "windows")]
+    InputMode::WasapiLoopback => {
+      println!("Input: WASAPI loopback (default render mix)");
+      let config = wasapi_config
+        .take()
+        .expect("wasapi configuration missing before capture start");
+
+      wasapi_loopback::spawn_loopback_capture(config, process_chunk)?;
+      _maybe_stream = None;
+    }
+    
     InputMode::Stdin => {
       println!("Input: stdin (reading raw bytes)");
       // Fill packet_meta from CLI flags with defaults if missing
@@ -388,15 +463,257 @@ where
   Ok(stream)
 }
 
+#[cfg(target_os = "windows")]
+mod wasapi_loopback {
+  use std::cmp;
+  use std::thread;
+
+  use anyhow::Context;
+  use wasapi::{
+    AudioCaptureClient, Direction, SampleType, StreamMode, WasapiError,
+    WaveFormat, deinitialize, get_default_device, initialize_mta,
+  };
+
+  use super::{MAX_PAYLOAD, Meta, Result, SampleFormat, SampleRate};
+
+  pub(super) struct LoopbackConfig {
+    format: WaveFormat,
+  }
+
+  struct ComGuard;
+
+  impl ComGuard {
+    fn init_mta() -> Result<Self> {
+      initialize_mta()
+        .ok()
+        .context("failed to initialize COM for WASAPI loopback")?;
+      Ok(Self)
+    }
+  }
+
+  impl Drop for ComGuard {
+    fn drop(&mut self) {
+      deinitialize();
+    }
+  }
+
+  pub(super) fn prepare_loopback() -> Result<(Meta, LoopbackConfig)> {
+    let _com = ComGuard::init_mta()?;
+    let device = get_default_device(&Direction::Render)
+      .context("no default render device for loopback")?;
+    let audio_client = device
+      .get_iaudioclient()
+      .context("failed to get IAudioClient for loopback")?;
+    let mix_format = audio_client
+      .get_mixformat()
+      .context("failed to query mix format for loopback")?;
+
+    let sample_rate = mix_format.get_samplespersec();
+    let channels = mix_format.get_nchannels();
+    let channel_mask = mix_format.get_dwchannelmask();
+
+    let desired_format = WaveFormat::new(
+      32,
+      32,
+      &SampleType::Float,
+      sample_rate as usize,
+      channels as usize,
+      Some(channel_mask),
+    );
+
+    let meta = Meta {
+      channels: channels.min(255) as u8,
+      sample_rate: SampleRate(sample_rate),
+      sample_format: SampleFormat::F32,
+    };
+
+    Ok((
+      meta,
+      LoopbackConfig {
+        format: desired_format,
+      },
+    ))
+  }
+
+  pub(super) fn spawn_loopback_capture<F>(
+    config: LoopbackConfig,
+    process_chunk: F,
+  ) -> Result<()>
+  where
+    F: FnMut(&[u8]) -> Result<()> + Send + 'static,
+  {
+    eprintln!("Channels: {:?}", config.format.get_nchannels());
+    eprintln!("Sample Rate: {:?}", config.format.get_samplespersec());
+    eprintln!("Sample Bits: {:?}", config.format.get_bitspersample());
+    eprintln!("Sample Format: {:?}", config.format.get_subformat());
+    eprintln!("Block Align: {:?}", config.format.get_blockalign());
+
+    thread::Builder::new()
+      .name("wasapi-loopback".to_string())
+      .spawn(move || {
+        super::boost_current_thread_priority();
+        if let Err(err) = run_loopback_capture(config.format, process_chunk) {
+          eprintln!("WASAPI loopback capture error: {err:?}");
+        }
+      })
+      .context("failed to spawn WASAPI loopback thread")?;
+    Ok(())
+  }
+
+  fn run_loopback_capture<F>(
+    format: WaveFormat,
+    mut process_chunk: F,
+  ) -> Result<()>
+  where
+    F: FnMut(&[u8]) -> Result<()>,
+  {
+    let _com = ComGuard::init_mta()?;
+    let device = get_default_device(&Direction::Render)
+      .context("no default render device for loopback")?;
+    let mut audio_client = device
+      .get_iaudioclient()
+      .context("failed to get IAudioClient for loopback")?;
+    let (_default_period, min_period) = audio_client
+      .get_device_period()
+      .context("failed to query device period for loopback")?;
+
+    let stream_mode = StreamMode::EventsShared {
+      autoconvert: true,
+      buffer_duration_hns: min_period,
+    };
+
+    audio_client
+      .initialize_client(&format, &Direction::Capture, &stream_mode)
+      .context("failed to initialize WASAPI loopback client")?;
+
+    let event = audio_client
+      .set_get_eventhandle()
+      .context("failed to create loopback event handle")?;
+    let capture_client = audio_client
+      .get_audiocaptureclient()
+      .context("failed to get AudioCaptureClient for loopback")?;
+
+    let start_result = audio_client.start_stream();
+    if let Err(err) = start_result {
+      let _ = audio_client.stop_stream();
+      return Err(err).context("failed to start WASAPI loopback stream");
+    }
+
+    let frame_bytes = format.get_blockalign() as usize;
+    let frames_per_chunk = cmp::max(1, MAX_PAYLOAD / frame_bytes);
+    let chunk_stride = frames_per_chunk * frame_bytes;
+
+    let run_result = loop {
+      if let Err(err) = drain_packets(
+        &capture_client,
+        chunk_stride,
+        frame_bytes,
+        &mut process_chunk,
+      ) {
+        break Err(err);
+      }
+      match event.wait_for_event(2000) {
+        Ok(()) => {}
+        Err(WasapiError::EventTimeout) => continue,
+        Err(other) => break Err(other.into()),
+      }
+    };
+
+    let _ = audio_client.stop_stream();
+    run_result
+  }
+
+  fn drain_packets<F>(
+    capture_client: &AudioCaptureClient,
+    chunk_stride: usize,
+    frame_bytes: usize,
+    process_chunk: &mut F,
+  ) -> Result<()>
+  where
+    F: FnMut(&[u8]) -> Result<()>,
+  {
+    loop {
+      let packet = capture_client
+        .get_next_packet_size()
+        .context("failed to query next packet size")?;
+      let Some(frames) = packet else { break };
+      if frames == 0 {
+        break;
+      }
+
+      let mut buffer = vec![0u8; frames as usize * frame_bytes];
+      let (frames_read, info) = capture_client
+        .read_from_device(&mut buffer)
+        .context("failed to read loopback packet")?;
+
+      let used = frames_read as usize * frame_bytes;
+      if used == 0 {
+        continue;
+      }
+
+      if info.flags.silent {
+        buffer[..used].fill(0);
+      }
+
+      let stride = cmp::max(chunk_stride, frame_bytes);
+      let mut offset = 0;
+      while offset < used {
+        let end = (offset + stride).min(used);
+        process_chunk(&buffer[offset..end])?;
+        offset = end;
+      }
+    }
+
+    Ok(())
+  }
+}
+
 fn parse_input_mode(s: &str) -> Result<InputMode> {
   match s.to_ascii_lowercase().as_str() {
     #[cfg(feature = "cpal")]
     "cpal" => Ok(InputMode::Cpal),
+    #[cfg(target_os = "windows")]
+    "wasapi" | "loopback" => Ok(InputMode::WasapiLoopback),
     "stdin" => Ok(InputMode::Stdin),
-    #[cfg(feature = "cpal")]
-    _ => bail!("invalid input mode: {} (expected: cpal|stdin)", s),
-    #[cfg(not(feature = "cpal"))]
-    _ => bail!("invalid input mode: {} (expected: stdin)", s),
+    other => bail!(
+      "invalid input mode: {} (expected: {})",
+      other,
+      input_mode_options()
+    ),
+  }
+}
+
+fn input_mode_options() -> &'static str {
+  #[cfg(all(feature = "cpal", target_os = "windows"))]
+  {
+    "cpal|wasapi|stdin"
+  }
+  #[cfg(all(feature = "cpal", not(target_os = "windows")))]
+  {
+    "cpal|stdin"
+  }
+  #[cfg(all(not(feature = "cpal"), target_os = "windows"))]
+  {
+    "wasapi|stdin"
+  }
+  #[cfg(all(not(feature = "cpal"), not(target_os = "windows")))]
+  {
+    "stdin"
+  }
+}
+
+fn default_input_mode_name() -> &'static str {
+  #[cfg(feature = "cpal")]
+  {
+    "cpal"
+  }
+  #[cfg(all(not(feature = "cpal"), target_os = "windows"))]
+  {
+    "wasapi"
+  }
+  #[cfg(all(not(feature = "cpal"), not(target_os = "windows")))]
+  {
+    "stdin"
   }
 }
 
@@ -561,17 +878,17 @@ impl SendWorker {
 }
 
 fn print_usage() {
+  let input_modes = input_mode_options();
+  let default_mode = default_input_mode_name();
   eprintln!(
-        "Usage: udp_sender <server_addr:port> [options]\n\
-         Required:\n\
-           <server_addr:port>          Destination address\n\
-         Options:\n\
-           -i, --input <cpal|stdin>    Input source (default: cpal)\n\
-           -c, --channels <1..255>     Channels for stdin (default: 2)\n\
-           -r, --rate <hz>             Sample rate for stdin (default: 48000)\n\
-           -f, --format <f32|i16|u16|u32>  Sample format for stdin (default: u32)\n\
-           -h, --help                  Show this help"
-    );
+    "Usage: udp_sender <server_addr:port> \
+     [options]\nRequired:\n<server_addr:port>          Destination \
+     address\nOptions:\n-i, --input <{input_modes}>    Input source (default: \
+     {default_mode})\n-c, --channels <1..255>     Channels for stdin \
+     (default: 2)\n-r, --rate <hz>             Sample rate for stdin \
+     (default: 48000)\n-f, --format <f32|i16|u16|u32>  Sample format for \
+     stdin (default: u32)\n-h, --help                  Show this help"
+  );
 }
 
 fn wait_for_pong_handshake(

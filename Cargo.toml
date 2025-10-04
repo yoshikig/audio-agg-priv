@@ -12,6 +12,12 @@ thread-priority = "3.0.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 system_status_bar_macos = "0.1.3"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.19"
+windows = { version = "0.62.1", features = [
+    "Win32_System_Threading",
+] }
+
 [features]
 default = []
 use_cpal = ["cpal"]

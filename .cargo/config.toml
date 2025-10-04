@@ -5,6 +5,9 @@ linker = "aarch64-unknown-linux-gnu-gcc"
 [target.x86_64-unknown-linux-gnu]
 linker = "x86_64-unknown-linux-gnu-gcc"
 
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-gcc"
+
 # If you were targeting a 32-bit Pi, you would add this section:
 # [target.armv7-unknown-linux-gnueabihf]
 # linker = "arm-linux-gnueabihf-gcc"
