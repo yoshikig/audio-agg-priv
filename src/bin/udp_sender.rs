@@ -419,10 +419,11 @@ fn main() -> Result<()> {
       let now: Instant = Instant::now();
       let db = meter.lock().unwrap().dbfs(now);
       print!(
-        "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Vol1s: {:>6.1} \
-         dBFS   ",
+        "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Pkts/s: {:>6.1} | \
+         Vol1s: {:>6.1} dBFS   ",
         stats.total_bytes_sent as f64 / (1024.0 * 1024.0),
         stats.average_rate_bps / 1024.0,
+        stats.average_packets_per_sec,
         db
       );
       let _ = io::stdout().flush();
@@ -790,6 +791,7 @@ struct SendWorker {
   sequence_number: u64,
   last_update_time: Instant,
   byte_rate: RollingRate,
+  packet_rate: RollingRate,
   warned_sample_align: bool,
   prev_silent: bool,
   update_interval: Duration,
@@ -815,6 +817,7 @@ impl SendWorker {
       sequence_number: 0,
       last_update_time: Instant::now(),
       byte_rate: RollingRate::new(window),
+      packet_rate: RollingRate::new(window),
       warned_sample_align: false,
       prev_silent: false,
       update_interval,
@@ -882,12 +885,15 @@ impl SendWorker {
     let sent_packet_size = send_buf.len();
     self.total_bytes_sent += sent_packet_size as u64;
     self.byte_rate.record(now, sent_packet_size as u64);
+    self.packet_rate.record(now, 1);
 
     if now.duration_since(self.last_update_time) >= self.update_interval {
       let average_rate_bps = self.byte_rate.rate_per_sec(now);
+      let average_packets_per_sec = self.packet_rate.rate_per_sec(now);
       let _ = self.stats_tx.send(SendStats {
         total_bytes_sent: self.total_bytes_sent,
         average_rate_bps,
+        average_packets_per_sec,
       });
       self.last_update_time = now;
     }
