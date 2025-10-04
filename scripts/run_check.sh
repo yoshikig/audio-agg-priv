@@ -3,7 +3,7 @@
 set -euxo pipefail
 
 CARGO_ARG=""
-if [ sw_vers > /dev/null 2>&1 ]; then
+if $(sw_vers > /dev/null 2>&1); then
   CARGO_ARG=""
 else
   CARGO_ARG="--config target.x86_64-unknown-linux-gnu.linker=\"\""
