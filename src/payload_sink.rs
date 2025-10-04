@@ -31,6 +31,7 @@ impl BinarySink {
     let ch = meta.channels.to_string();
     let mut child = Command::new("pw-cat")
       .arg("--playback")
+      .arg("--raw")
       .arg("--rate")
       .arg(rate)
       .arg("--channels")
