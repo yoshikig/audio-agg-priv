@@ -1,8 +1,9 @@
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
+
 use crate::rate::{RollingMean, RollingRate};
 use crate::sync_controller::{DefaultSyncController, SyncController};
 use crate::volume::VolumeMeter;
-use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
 
 // Collects, computes and prints rolling statistics for the receiver.
 pub struct RecvStats {
@@ -77,8 +78,8 @@ impl RecvStats {
 
     format!(
       "\r[{}] Recv: {} | Lost: {} ({:.2}%) | Late: {} | Total: {:.2} MB | \
-             Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Vol10s: {:>6.1} dBFS | \
-             Off: {:+.2} ms | Drift: {:+.1} ppm   ",
+       Avg10s: {:.2} KB/s | Lat10s: {:.2} ms | Vol10s: {:>6.1} dBFS | Off: \
+       {:+.2} ms | Drift: {:+.1} ppm   ",
       src_addr,
       self.total_packets_received,
       self.lost_packets,

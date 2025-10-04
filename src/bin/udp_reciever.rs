@@ -1,14 +1,15 @@
-use sound_send::packet::{
-  decode_message, respond_to_ping, Message, SyncMessage,
-};
-use sound_send::payload_sink::BinarySink;
-use sound_send::recv_stats::RecvStats;
-use sound_send::sync_controller::DefaultSyncController;
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
+
+use sound_send::packet::{
+  Message, SyncMessage, decode_message, respond_to_ping,
+};
+use sound_send::payload_sink::BinarySink;
+use sound_send::recv_stats::RecvStats;
+use sound_send::sync_controller::DefaultSyncController;
 // no local process spawning; handled by payload_sink
 
 // RecvStats moved to sound_send::recv_stats

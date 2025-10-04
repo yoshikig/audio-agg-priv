@@ -1,10 +1,10 @@
 // Packet multiplexer: expose data and sync APIs and provide unified decode.
 
 pub use crate::packet_data::{
-  decode_packet, encode_packet, DataPacketError, Decoded, Meta, SampleRateCode,
+  DataPacketError, Decoded, Meta, SampleRateCode, decode_packet, encode_packet,
 };
 pub use crate::packet_sync::{
-  decode_sync, encode_sync, SyncDecodeError, SyncMessage,
+  SyncDecodeError, SyncMessage, decode_sync, encode_sync,
 };
 // Re-export data and sync constants/types via this facade.
 

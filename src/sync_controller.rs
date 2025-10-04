@@ -1,7 +1,8 @@
-use crate::packet_sync::{encode_sync, SyncMessage};
-use crate::timesync::TimeSync;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::packet_sync::{SyncMessage, encode_sync};
+use crate::timesync::TimeSync;
 
 pub(crate) trait SyncController {
   fn register_sender(&mut self, addr: SocketAddr);

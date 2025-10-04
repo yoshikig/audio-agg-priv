@@ -1,13 +1,3 @@
-use anyhow::{bail, Context, Result};
-use bytemuck;
-use sound_send::packet::{
-  decode_message, encode_sync, respond_to_ping, Message, SampleFormat,
-  SampleRate, SyncMessage,
-};
-use sound_send::packet::{encode_packet, Meta};
-use sound_send::rate::RollingRate;
-use sound_send::send_stats::SendStats;
-use sound_send::volume::VolumeMeter;
 use std::env;
 use std::io::{self, Read};
 use std::net::UdpSocket;
@@ -15,8 +5,19 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result, bail};
+use bytemuck;
+use sound_send::packet::{
+  Message, SampleFormat, SampleRate, SyncMessage, decode_message, encode_sync,
+  respond_to_ping,
+};
+use sound_send::packet::{Meta, encode_packet};
+use sound_send::rate::RollingRate;
+use sound_send::send_stats::SendStats;
+use sound_send::volume::VolumeMeter;
+
 const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
-                                       // Static asserts: ensure MAX_PAYLOAD aligns to all supported sample sizes
+// Static asserts: ensure MAX_PAYLOAD aligns to all supported sample sizes
 const _: [(); MAX_PAYLOAD % 2] = [(); 0];
 const _: [(); MAX_PAYLOAD % 4] = [(); 0];
 
@@ -225,7 +226,7 @@ fn main() -> Result<()> {
       }
       "-i" | "--input" => {
         let val = args.next().ok_or_else(|| {
-          anyhow::anyhow!("--input requires a value: cpal|stdin")
+          anyhow::anyhow!("--input requires a value: {}", input_mode_options())
         })?;
         input_mode = parse_input_mode(&val)?;
       }
@@ -248,7 +249,8 @@ fn main() -> Result<()> {
 
   let server_addr = server_addr.ok_or_else(|| {
     anyhow::anyhow!(
-      "missing destination. Usage: udp_sender <addr:port> [--input cpal|stdin]"
+      "missing destination. Usage: udp_sender <addr:port> [--input {}]",
+      input_mode_options()
     )
   })?;
 
@@ -261,7 +263,7 @@ fn main() -> Result<()> {
 
   // --- 2. Configure input source ---
   let _maybe_stream: Option<Stream>; // keep stream alive when in CPAL mode
-                                     // Metadata to include in each packet
+  // Metadata to include in each packet
   let mut packet_meta = Meta {
     channels: 0,
     sample_rate: SampleRate(0),
@@ -284,8 +286,8 @@ fn main() -> Result<()> {
 
       let host = cpal::default_host();
       let device = host
-          .default_input_device()
-          .context("no default input device found")?;
+        .default_input_device()
+        .context("no default input device found")?;
       Some(device)
     }
     _ => None,
@@ -341,7 +343,11 @@ fn main() -> Result<()> {
   match input_mode {
     #[cfg(feature = "cpal")]
     InputMode::Cpal => {
-      let stream = generate_cpal_stream(device.as_ref().unwrap(), packet_meta.sample_format, process_chunk)?;
+      let stream = generate_cpal_stream(
+        device.as_ref().unwrap(),
+        packet_meta.sample_format,
+        process_chunk,
+      )?;
       _maybe_stream = Some(stream);
     }
 
@@ -355,14 +361,11 @@ fn main() -> Result<()> {
       wasapi_loopback::spawn_loopback_capture(config, process_chunk)?;
       _maybe_stream = None;
     }
-    
+
     InputMode::Stdin => {
       println!("Input: stdin (reading raw bytes)");
-      // Fill packet_meta from CLI flags with defaults if missing
-      packet_meta.channels = opt_channels.unwrap_or(2);
-      packet_meta.sample_rate = SampleRate(opt_sample_rate.unwrap_or(48_000));
-      packet_meta.sample_format = opt_format.unwrap_or(SampleFormat::U32);
       std::thread::spawn(move || {
+        boost_current_thread_priority();
         let mut stdin = io::stdin().lock();
         let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
@@ -416,11 +419,12 @@ fn main() -> Result<()> {
       let now: Instant = Instant::now();
       let db = meter.lock().unwrap().dbfs(now);
       print!(
-                "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Vol1s: {:>6.1} dBFS   ",
-                stats.total_bytes_sent as f64 / (1024.0 * 1024.0),
-                stats.average_rate_bps / 1024.0,
-                db
-            );
+        "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Vol1s: {:>6.1} \
+         dBFS   ",
+        stats.total_bytes_sent as f64 / (1024.0 * 1024.0),
+        stats.average_rate_bps / 1024.0,
+        db
+      );
       let _ = io::stdout().flush();
     }
   }
@@ -453,7 +457,9 @@ where
       while offset < bytes.len() {
         let end = (offset + MAX_PAYLOAD).min(bytes.len());
         let chunk = &bytes[offset..end];
-        if process_chunk(chunk).is_err() { break; }
+        if process_chunk(chunk).is_err() {
+          break;
+        }
         offset = end;
       }
     },
@@ -743,22 +749,30 @@ fn bytes_per_sample(fmt: SampleFormat) -> usize {
 fn is_silent_chunk(fmt: SampleFormat, data: &[u8]) -> bool {
   match fmt {
     SampleFormat::F32 => {
-      if data.len() % 4 != 0 { return false; }
+      if data.len() % 4 != 0 {
+        return false;
+      }
       let s: &[f32] = bytemuck::cast_slice(data);
       s.iter().all(|&v| v == 0.0)
     }
     SampleFormat::I16 => {
-      if data.len() % 2 != 0 { return false; }
+      if data.len() % 2 != 0 {
+        return false;
+      }
       let s: &[i16] = bytemuck::cast_slice(data);
       s.iter().all(|&v| v == 0)
     }
     SampleFormat::U16 => {
-      if data.len() % 2 != 0 { return false; }
+      if data.len() % 2 != 0 {
+        return false;
+      }
       let s: &[u16] = bytemuck::cast_slice(data);
       s.iter().all(|&v| v == 0x8000)
     }
     SampleFormat::U32 => {
-      if data.len() % 4 != 0 { return false; }
+      if data.len() % 4 != 0 {
+        return false;
+      }
       let s: &[u32] = bytemuck::cast_slice(data);
       s.iter().all(|&v| v == 0x8000_0000)
     }
@@ -815,9 +829,15 @@ impl SendWorker {
     // Determine if this chunk is silence and collapse repeated silence
     let bps = bytes_per_sample(self.packet_meta.sample_format);
     let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
-    let is_silent = aligned && is_silent_chunk(self.packet_meta.sample_format, audio_chunk);
-    let payload: &[u8] = if is_silent && self.prev_silent { &[] } else { audio_chunk };
-    let send_buf = encode_packet(self.sequence_number, payload, self.packet_meta, ts_ms);
+    let is_silent =
+      aligned && is_silent_chunk(self.packet_meta.sample_format, audio_chunk);
+    let payload: &[u8] = if is_silent && self.prev_silent {
+      &[]
+    } else {
+      audio_chunk
+    };
+    let send_buf =
+      encode_packet(self.sequence_number, payload, self.packet_meta, ts_ms);
     self.prev_silent = is_silent;
 
     if self
@@ -836,7 +856,8 @@ impl SendWorker {
       if !aligned && !self.warned_sample_align {
         eprintln!(
           "warning: payload length {} is not a multiple of 1-sample ({} bytes)",
-          audio_chunk.len(), bps
+          audio_chunk.len(),
+          bps
         );
         self.warned_sample_align = true;
       }
@@ -951,25 +972,27 @@ fn spawn_timesync_responder(socket: &UdpSocket) {
     .try_clone()
     .expect("failed to clone udp socket for timesync");
 
-  std::thread::spawn(move || loop {
-    let mut buf = [0u8; 64];
-    match ts_sock.recv_from(&mut buf) {
-      Ok((n, addr)) => {
-        if let Ok(Message::Sync(SyncMessage::Ping { t0_ms })) =
-          decode_message(&buf[..n])
-        {
-          respond_to_ping(&ts_sock, addr, t0_ms);
+  std::thread::spawn(move || {
+    loop {
+      let mut buf = [0u8; 64];
+      match ts_sock.recv_from(&mut buf) {
+        Ok((n, addr)) => {
+          if let Ok(Message::Sync(SyncMessage::Ping { t0_ms })) =
+            decode_message(&buf[..n])
+          {
+            respond_to_ping(&ts_sock, addr, t0_ms);
+          }
         }
+        Err(ref e)
+          if e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+          // Nonblocking poll; back off briefly
+          std::thread::sleep(std::time::Duration::from_millis(2));
+          continue;
+        }
+        Err(_) => break,
       }
-      Err(ref e)
-        if e.kind() == std::io::ErrorKind::WouldBlock
-          || e.kind() == std::io::ErrorKind::TimedOut =>
-      {
-        // Nonblocking poll; back off briefly
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        continue;
-      }
-      Err(_) => break,
     }
   });
 }

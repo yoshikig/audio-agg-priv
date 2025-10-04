@@ -1,6 +1,7 @@
-use crate::packet::Meta;
 use std::io::{self, Write};
 use std::process::{Child, Command, Stdio};
+
+use crate::packet::Meta;
 
 pub struct BinarySink {
   use_pipewire: bool,
@@ -57,7 +58,8 @@ impl BinarySink {
       match self.pw_stdin.as_mut().unwrap().write_all(payload) {
         Ok(()) => {}
         Err(e) => {
-          // Try one restart on write failure (e.g., broken pipe), then retry once
+          // Try one restart on write failure (e.g., broken pipe), then retry
+          // once
           let _ = self.teardown_child();
           self.spawn_pw(meta)?;
           self

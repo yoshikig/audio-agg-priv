@@ -110,8 +110,8 @@ pub fn decode_sync(data: &[u8]) -> Result<SyncMessage, SyncDecodeError> {
 mod tests {
   use super::*;
   use crate::packet::{
-    decode_message, encode_packet, Message, Meta, SampleFormat, SampleRate,
-    SyncMessage,
+    Message, Meta, SampleFormat, SampleRate, SyncMessage, decode_message,
+    encode_packet,
   };
 
   #[test]

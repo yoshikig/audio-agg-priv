@@ -1,12 +1,15 @@
-use crate::send_stats::SendStats;
 use std::cell::RefCell;
 use std::sync::mpsc as channel;
+
 use system_status_bar_macos::*;
+
+use crate::send_stats::SendStats;
 
 pub fn show_status_icon(receiver: channel::Receiver<SendStats>) {
   let (event_loop, terminator) = sync_event_loop(receiver, |_stat| {
-    //let status_text = format!("Sent: {} bytes, Rate: {:.2} bps", stat.total_bytes_sent, stat.average_rate_bps);
-    //status_item.borrow_mut().menu().
+    //let status_text = format!("Sent: {} bytes, Rate: {:.2} bps",
+    // stat.total_bytes_sent, stat.average_rate_bps); status_item.
+    // borrow_mut().menu().
   });
 
   // Implementation for showing status icon on macOS

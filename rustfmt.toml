@@ -1,2 +1,6 @@
+style_edition = "2024"
 max_width = 80
+format_strings = true
+wrap_comments = true
 tab_spaces = 2
+group_imports = "StdExternalCrate"

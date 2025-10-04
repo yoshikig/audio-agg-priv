@@ -1,8 +1,9 @@
 // src/packet_data.rs
 
-use crate::packet::{SampleFormat, SampleRate, DATA_PACKET_MAGIC};
+use crate::packet::{DATA_PACKET_MAGIC, SampleFormat, SampleRate};
 
-// IMPORTANT: Bump PACKET_VERSION whenever the on-wire packet header/layout changes.
+// IMPORTANT: Bump PACKET_VERSION whenever the on-wire packet header/layout
+// changes.
 const PACKET_VERSION: u8 = 2;
 
 /// Data packet format utilities (audio payloads).
@@ -166,7 +167,8 @@ pub fn encode_packet(
 }
 
 /// Decodes a packet into `Decoded { seq, meta, payload }`.
-/// Returns a slice into the original buffer for the payload to avoid allocation.
+/// Returns a slice into the original buffer for the payload to avoid
+/// allocation.
 pub fn decode_packet<'a>(
   data: &'a [u8],
 ) -> Result<Decoded<'a>, DataPacketError> {
