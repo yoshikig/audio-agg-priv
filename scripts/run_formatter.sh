@@ -2,5 +2,5 @@
 
 set -euxo pipefail
 
-cargo +nightly fmt;
+cargo +nightly fmt --all
 
