@@ -22,4 +22,5 @@ else
   sudo apt update
   sudo apt install -y gcc-mingw-w64
   sudo apt install -y gcc-aarch64-linux-gnu
+  sudo apt install -y libasound2-dev
 fi
