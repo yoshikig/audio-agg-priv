@@ -16,10 +16,11 @@ use sound_send::rate::RollingRate;
 use sound_send::send_stats::SendStats;
 use sound_send::volume::VolumeMeter;
 
-const MAX_PAYLOAD: usize = 1024 + 256; // payload only (excludes our header)
+// 1024 bytes: every 2.67ms in 48kHz stereo f32
+const MAX_PAYLOAD: usize = 1024; // payload only (excludes our header)
 // Static asserts: ensure MAX_PAYLOAD aligns to all supported sample sizes
-const _: [(); MAX_PAYLOAD % 2] = [(); 0];
-const _: [(); MAX_PAYLOAD % 4] = [(); 0];
+const PAYLOAD_ALIGNMENT: usize = 8;
+const _: [(); MAX_PAYLOAD % PAYLOAD_ALIGNMENT] = [(); 0];
 
 const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 const STATS_WINDOW: Duration = Duration::from_secs(10);
@@ -472,7 +473,6 @@ where
 
 #[cfg(target_os = "windows")]
 mod wasapi_loopback {
-  use std::cmp;
   use std::thread;
 
   use anyhow::Context;
@@ -481,7 +481,7 @@ mod wasapi_loopback {
     WaveFormat, deinitialize, get_default_device, initialize_mta,
   };
 
-  use super::{MAX_PAYLOAD, Meta, Result, SampleFormat, SampleRate};
+  use super::{MAX_PAYLOAD, PAYLOAD_ALIGNMENT, Meta, Result, SampleFormat, SampleRate};
 
   pub(super) struct LoopbackConfig {
     format: WaveFormat,
@@ -607,13 +607,13 @@ mod wasapi_loopback {
     }
 
     let frame_bytes = format.get_blockalign() as usize;
-    let frames_per_chunk = cmp::max(1, MAX_PAYLOAD / frame_bytes);
-    let chunk_stride = frames_per_chunk * frame_bytes;
+    assert!(PAYLOAD_ALIGNMENT % frame_bytes == 0);
+    assert!(MAX_PAYLOAD % frame_bytes == 0);
 
     let run_result = loop {
       if let Err(err) = drain_packets(
         &capture_client,
-        chunk_stride,
+        MAX_PAYLOAD,
         frame_bytes,
         &mut process_chunk,
       ) {
@@ -639,6 +639,9 @@ mod wasapi_loopback {
   where
     F: FnMut(&[u8]) -> Result<()>,
   {
+    assert!(chunk_stride % frame_bytes == 0);
+    assert!(chunk_stride >= frame_bytes);
+
     loop {
       let packet = capture_client
         .get_next_packet_size()
@@ -662,10 +665,9 @@ mod wasapi_loopback {
         buffer[..used].fill(0);
       }
 
-      let stride = cmp::max(chunk_stride, frame_bytes);
       let mut offset = 0;
       while offset < used {
-        let end = (offset + stride).min(used);
+        let end = (offset + chunk_stride).min(used);
         process_chunk(&buffer[offset..end])?;
         offset = end;
       }
