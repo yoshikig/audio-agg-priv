@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Read};
+use std::io;
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use bytemuck;
 use sound_send::packet::{
-  Message, SampleFormat, SampleRate, SyncMessage, decode_message, encode_sync,
+  Message, SampleFormat, SyncMessage, decode_message, encode_sync,
   respond_to_ping,
 };
 use sound_send::packet::{Meta, encode_packet};
@@ -37,10 +37,31 @@ enum InputMode {
   Stdin,
 }
 
-#[cfg(feature = "cpal")]
-type Stream = cpal::Stream;
-#[cfg(not(feature = "cpal"))]
-type Stream = ();
+mod audio_sources;
+
+use audio_sources::{InputOptions, InputSource, ProcessChunk, StdinInput};
+
+fn build_input_source(input_mode: InputMode) -> Result<Box<dyn InputSource>> {
+  match input_mode {
+    #[cfg(feature = "cpal")]
+    InputMode::Cpal => {
+      use audio_sources::cpal::CpalInput;
+      use cpal::traits::HostTrait;
+
+      let host = cpal::default_host();
+      let device = host
+        .default_input_device()
+        .context("no default input device found")?;
+      Ok(Box::new(CpalInput::new(device)))
+    }
+    #[cfg(target_os = "windows")]
+    InputMode::WasapiLoopback => {
+      use audio_sources::WasapiInput;
+      Ok(Box::new(WasapiInput::default()))
+    },
+    InputMode::Stdin => Ok(Box::new(StdinInput)),
+  }
+}
 
 #[cfg(target_os = "windows")]
 fn boost_current_thread_priority() {
@@ -76,74 +97,6 @@ fn boost_process_priority() {
 
 #[cfg(not(target_os = "windows"))]
 fn boost_process_priority() {}
-
-#[cfg(feature = "cpal")]
-fn generate_cpal_stream(
-  device: &cpal::Device,
-  sample_format: SampleFormat,
-  process_chunk: impl FnMut(&[u8]) -> Result<()> + Send + 'static,
-) -> Result<Stream> {
-  use cpal::traits::{DeviceTrait, StreamTrait};
-
-  let supported_config = device
-    .default_input_config()
-    .context("failed to get default input config")?;
-  let config = supported_config.config();
-
-  let stream: cpal::Stream = match sample_format {
-    SampleFormat::F32 => {
-      build_cpal_input_stream::<f32>(&device, &config, process_chunk)?
-    }
-    SampleFormat::I16 => {
-      build_cpal_input_stream::<i16>(&device, &config, process_chunk)?
-    }
-    SampleFormat::U16 => {
-      build_cpal_input_stream::<u16>(&device, &config, process_chunk)?
-    }
-    other => bail!("unsupported sample format: {:?}", other),
-  };
-  stream.play().context("failed to start input stream")?;
-
-  Ok(stream)
-}
-
-#[cfg(feature = "cpal")]
-fn generate_cpal_meta(device: &cpal::Device) -> Result<Meta> {
-  use cpal::traits::DeviceTrait;
-
-  // Metadata to include in each packet
-  let mut packet_meta = Meta {
-    channels: 0,
-    sample_rate: SampleRate(0),
-    sample_format: SampleFormat::F32,
-  };
-
-  println!("Input: CPAL (default audio input)");
-  let supported_config = device
-    .default_input_config()
-    .context("failed to get default input config")?;
-
-  let config = supported_config.config();
-  eprintln!("Device: {:?}", device.name().ok());
-  eprintln!(
-    "  Sample Format: {:?}\n  Sample Rate: {} Hz\n  Channels: {}",
-    supported_config.sample_format(),
-    config.sample_rate.0,
-    config.channels
-  );
-
-  // Build metadata (1 byte each)
-  packet_meta.channels = config.channels.min(255) as u8;
-  packet_meta.sample_rate = config.sample_rate.into();
-  packet_meta.sample_format = match supported_config.sample_format() {
-    cpal::SampleFormat::F32 => SampleFormat::F32,
-    cpal::SampleFormat::I16 => SampleFormat::I16,
-    cpal::SampleFormat::U16 => SampleFormat::U16,
-    _ => SampleFormat::Unknown,
-  };
-
-  Ok(packet_meta)
-}
 
 fn main() -> Result<()> {
   // --- 1. Parse args and set up socket ---
@@ -263,69 +216,20 @@ fn main() -> Result<()> {
   let meter = Arc::new(Mutex::new(VolumeMeter::new(VOLUME_WINDOW)));
 
   // --- 2. Configure input source ---
-  let _maybe_stream: Option<Stream>; // keep stream alive when in CPAL mode
-  // Metadata to include in each packet
-  let mut packet_meta = Meta {
-    channels: 0,
-    sample_rate: SampleRate(0),
-    sample_format: SampleFormat::F32,
+  let input_options = InputOptions {
+    channels: opt_channels,
+    sample_rate: opt_sample_rate,
+    format: opt_format,
   };
-
-  #[cfg(target_os = "windows")]
-  let mut wasapi_config: Option<wasapi_loopback::LoopbackConfig> = None;
+  let mut input_source = build_input_source(input_mode)?;
+  input_source.validate_options(&input_options)?;
+  let packet_meta = input_source.prepare_meta(&input_options)?;
 
   // --- 3. Move sending to a worker thread; main prints stats ---
   let (stats_tx, stats_rx) = mpsc::channel::<SendStats>();
   let send_sock = socket
     .try_clone()
     .context("failed to clone socket for sender thread")?;
-
-  #[cfg(feature = "cpal")]
-  let device = match input_mode {
-    InputMode::Cpal => {
-      use cpal::traits::HostTrait;
-
-      let host = cpal::default_host();
-      let device = host
-        .default_input_device()
-        .context("no default input device found")?;
-      Some(device)
-    }
-    _ => None,
-  };
-
-  match input_mode {
-    #[cfg(feature = "cpal")]
-    InputMode::Cpal => {
-      if opt_channels.is_some()
-        || opt_sample_rate.is_some()
-        || opt_format.is_some()
-      {
-        bail!("--channels/--rate/--format are only valid with --input stdin");
-      }
-
-      packet_meta = generate_cpal_meta(device.as_ref().unwrap())?;
-    }
-    #[cfg(target_os = "windows")]
-    InputMode::WasapiLoopback => {
-      if opt_channels.is_some()
-        || opt_sample_rate.is_some()
-        || opt_format.is_some()
-      {
-        bail!("--channels/--rate/--format are only valid with --input stdin");
-      }
-
-      let (meta, config) = wasapi_loopback::prepare_loopback()?;
-      packet_meta = meta;
-      wasapi_config = Some(config);
-    }
-    InputMode::Stdin => {
-      // Fill packet_meta from CLI flags with defaults if missing
-      packet_meta.channels = opt_channels.unwrap_or(2);
-      packet_meta.sample_rate = SampleRate(opt_sample_rate.unwrap_or(48_000));
-      packet_meta.sample_format = opt_format.unwrap_or(SampleFormat::U32);
-    }
-  }
 
   let mut worker: SendWorker = SendWorker::new(
     send_sock,
@@ -337,54 +241,9 @@ fn main() -> Result<()> {
     UPDATE_INTERVAL,
   );
 
-  let mut process_chunk = move |audio_chunk: &[u8]| -> Result<()> {
-    worker.process_chunk(audio_chunk)
-  };
-
-  match input_mode {
-    #[cfg(feature = "cpal")]
-    InputMode::Cpal => {
-      let stream = generate_cpal_stream(
-        device.as_ref().unwrap(),
-        packet_meta.sample_format,
-        process_chunk,
-      )?;
-      _maybe_stream = Some(stream);
-    }
-
-    #[cfg(target_os = "windows")]
-    InputMode::WasapiLoopback => {
-      println!("Input: WASAPI loopback (default render mix)");
-      let config = wasapi_config
-        .take()
-        .expect("wasapi configuration missing before capture start");
-
-      wasapi_loopback::spawn_loopback_capture(config, process_chunk)?;
-      _maybe_stream = None;
-    }
-
-    InputMode::Stdin => {
-      println!("Input: stdin (reading raw bytes)");
-      std::thread::spawn(move || {
-        boost_current_thread_priority();
-        let mut stdin = io::stdin().lock();
-        let mut buf = vec![0u8; MAX_PAYLOAD];
-        loop {
-          match stdin.read(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-              // Send exactly the bytes read
-              if process_chunk(&buf[..n]).is_err() {
-                break;
-              }
-            }
-            Err(_) => break,
-          }
-        }
-      });
-      _maybe_stream = None;
-    }
-  }
+  let process_chunk: ProcessChunk =
+    Box::new(move |audio_chunk: &[u8]| worker.process_chunk(audio_chunk));
+  let _input_guard = input_source.start(&packet_meta, process_chunk)?;
 
   // Perform handshake: wait for a Pong reply before starting data send
   wait_for_pong_handshake(&socket, &server_addr)?;
@@ -432,249 +291,6 @@ fn main() -> Result<()> {
   }
 
   Ok(())
-}
-
-#[cfg(feature = "cpal")]
-fn build_cpal_input_stream<T>(
-  device: &cpal::Device,
-  config: &cpal::StreamConfig,
-  mut process_chunk: impl FnMut(&[u8]) -> Result<()> + Send + 'static,
-) -> Result<cpal::Stream>
-where
-  T: cpal::Sample + cpal::SizedSample + bytemuck::Pod + bytemuck::Zeroable,
-{
-  use cpal::traits::DeviceTrait;
-
-  // Cast &[T] -> &[u8] safely via bytemuck
-  let err_fn = |err| eprintln!("input stream error: {err}");
-
-  let stream = device.build_input_stream(
-    config,
-    move |data: &[T], _| {
-      // Data is interleaved. Send in reasonably small chunks.
-      // For now, split the current callback buffer into UDP-sized chunks.
-      let bytes: &[u8] = bytemuck::cast_slice(data);
-      // Split to avoid exceeding typical MTU when adding our ~24-byte header
-      let mut offset = 0;
-      while offset < bytes.len() {
-        let end = (offset + MAX_PAYLOAD).min(bytes.len());
-        let chunk = &bytes[offset..end];
-        if process_chunk(chunk).is_err() {
-          break;
-        }
-        offset = end;
-      }
-    },
-    err_fn,
-    None,
-  )?;
-  Ok(stream)
-}
-
-#[cfg(target_os = "windows")]
-mod wasapi_loopback {
-  use std::thread;
-
-  use anyhow::Context;
-  use wasapi::{
-    AudioCaptureClient, Direction, SampleType, StreamMode, WasapiError,
-    WaveFormat, deinitialize, get_default_device, initialize_mta,
-  };
-
-  use super::{MAX_PAYLOAD, PAYLOAD_ALIGNMENT, Meta, Result, SampleFormat, SampleRate};
-
-  pub(super) struct LoopbackConfig {
-    format: WaveFormat,
-  }
-
-  struct ComGuard;
-
-  impl ComGuard {
-    fn init_mta() -> Result<Self> {
-      initialize_mta()
-        .ok()
-        .context("failed to initialize COM for WASAPI loopback")?;
-      Ok(Self)
-    }
-  }
-
-  impl Drop for ComGuard {
-    fn drop(&mut self) {
-      deinitialize();
-    }
-  }
-
-  pub(super) fn prepare_loopback() -> Result<(Meta, LoopbackConfig)> {
-    let _com = ComGuard::init_mta()?;
-    let device = get_default_device(&Direction::Render)
-      .context("no default render device for loopback")?;
-    let audio_client = device
-      .get_iaudioclient()
-      .context("failed to get IAudioClient for loopback")?;
-    let mix_format = audio_client
-      .get_mixformat()
-      .context("failed to query mix format for loopback")?;
-
-    let sample_rate = mix_format.get_samplespersec();
-    let channels = mix_format.get_nchannels();
-    let channel_mask = mix_format.get_dwchannelmask();
-
-    let desired_format = WaveFormat::new(
-      32,
-      32,
-      &SampleType::Float,
-      sample_rate as usize,
-      channels as usize,
-      Some(channel_mask),
-    );
-
-    let meta = Meta {
-      channels: channels.min(255) as u8,
-      sample_rate: SampleRate(sample_rate),
-      sample_format: SampleFormat::F32,
-    };
-
-    Ok((
-      meta,
-      LoopbackConfig {
-        format: desired_format,
-      },
-    ))
-  }
-
-  pub(super) fn spawn_loopback_capture<F>(
-    config: LoopbackConfig,
-    process_chunk: F,
-  ) -> Result<()>
-  where
-    F: FnMut(&[u8]) -> Result<()> + Send + 'static,
-  {
-    eprintln!("Channels: {:?}", config.format.get_nchannels());
-    eprintln!("Sample Rate: {:?}", config.format.get_samplespersec());
-    eprintln!("Sample Bits: {:?}", config.format.get_bitspersample());
-    eprintln!("Sample Format: {:?}", config.format.get_subformat());
-    eprintln!("Block Align: {:?}", config.format.get_blockalign());
-
-    thread::Builder::new()
-      .name("wasapi-loopback".to_string())
-      .spawn(move || {
-        super::boost_current_thread_priority();
-        if let Err(err) = run_loopback_capture(config.format, process_chunk) {
-          eprintln!("WASAPI loopback capture error: {err:?}");
-        }
-      })
-      .context("failed to spawn WASAPI loopback thread")?;
-    Ok(())
-  }
-
-  fn run_loopback_capture<F>(
-    format: WaveFormat,
-    mut process_chunk: F,
-  ) -> Result<()>
-  where
-    F: FnMut(&[u8]) -> Result<()>,
-  {
-    let _com = ComGuard::init_mta()?;
-    let device = get_default_device(&Direction::Render)
-      .context("no default render device for loopback")?;
-    let mut audio_client = device
-      .get_iaudioclient()
-      .context("failed to get IAudioClient for loopback")?;
-    let (_default_period, min_period) = audio_client
-      .get_device_period()
-      .context("failed to query device period for loopback")?;
-
-    let stream_mode = StreamMode::EventsShared {
-      autoconvert: true,
-      buffer_duration_hns: min_period,
-    };
-
-    audio_client
-      .initialize_client(&format, &Direction::Capture, &stream_mode)
-      .context("failed to initialize WASAPI loopback client")?;
-
-    let event = audio_client
-      .set_get_eventhandle()
-      .context("failed to create loopback event handle")?;
-    let capture_client = audio_client
-      .get_audiocaptureclient()
-      .context("failed to get AudioCaptureClient for loopback")?;
-
-    let start_result = audio_client.start_stream();
-    if let Err(err) = start_result {
-      let _ = audio_client.stop_stream();
-      return Err(err).context("failed to start WASAPI loopback stream");
-    }
-
-    let frame_bytes = format.get_blockalign() as usize;
-    assert!(PAYLOAD_ALIGNMENT % frame_bytes == 0);
-    assert!(MAX_PAYLOAD % frame_bytes == 0);
-
-    let run_result = loop {
-      if let Err(err) = drain_packets(
-        &capture_client,
-        MAX_PAYLOAD,
-        frame_bytes,
-        &mut process_chunk,
-      ) {
-        break Err(err);
-      }
-      match event.wait_for_event(2000) {
-        Ok(()) => {}
-        Err(WasapiError::EventTimeout) => continue,
-        Err(other) => break Err(other.into()),
-      }
-    };
-
-    let _ = audio_client.stop_stream();
-    run_result
-  }
-
-  fn drain_packets<F>(
-    capture_client: &AudioCaptureClient,
-    chunk_stride: usize,
-    frame_bytes: usize,
-    process_chunk: &mut F,
-  ) -> Result<()>
-  where
-    F: FnMut(&[u8]) -> Result<()>,
-  {
-    assert!(chunk_stride % frame_bytes == 0);
-    assert!(chunk_stride >= frame_bytes);
-
-    loop {
-      let packet = capture_client
-        .get_next_packet_size()
-        .context("failed to query next packet size")?;
-      let Some(frames) = packet else { break };
-      if frames == 0 {
-        break;
-      }
-
-      let mut buffer = vec![0u8; frames as usize * frame_bytes];
-      let (frames_read, info) = capture_client
-        .read_from_device(&mut buffer)
-        .context("failed to read loopback packet")?;
-
-      let used = frames_read as usize * frame_bytes;
-      if used == 0 {
-        continue;
-      }
-
-      if info.flags.silent {
-        buffer[..used].fill(0);
-      }
-
-      let mut offset = 0;
-      while offset < used {
-        let end = (offset + chunk_stride).min(used);
-        process_chunk(&buffer[offset..end])?;
-        offset = end;
-      }
-    }
-
-    Ok(())
-  }
 }
 
 fn parse_input_mode(s: &str) -> Result<InputMode> {
