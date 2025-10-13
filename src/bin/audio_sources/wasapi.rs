@@ -218,12 +218,7 @@ fn drain_packets(
       buffer[..used].fill(0);
     }
 
-    let mut offset = 0;
-    while offset < used {
-      let end = (offset + chunk_stride).min(used);
-      process_chunk(&buffer[offset..end])?;
-      offset = end;
-    }
+    process_chunk(&buffer[0..used])?;
   }
 
   Ok(())
