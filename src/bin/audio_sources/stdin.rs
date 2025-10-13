@@ -21,11 +21,7 @@ impl InputSource for StdinInput {
     })
   }
 
-  fn start(
-    &mut self,
-    _meta: &Meta,
-    process_chunk: ProcessChunk,
-  ) -> Result<()> {
+  fn start(&mut self, _meta: &Meta, process_chunk: ProcessChunk) -> Result<()> {
     println!("Input: stdin (reading raw bytes)");
     std::thread::spawn(move || {
       crate::boost_current_thread_priority();

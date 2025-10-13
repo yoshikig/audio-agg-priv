@@ -12,11 +12,7 @@ pub struct InputOptions {
 pub trait InputSource {
   fn validate_options(&self, opts: &InputOptions) -> Result<()>;
   fn prepare_meta(&mut self, opts: &InputOptions) -> Result<Meta>;
-  fn start(
-    &mut self,
-    meta: &Meta,
-    process_chunk: ProcessChunk,
-  ) -> Result<()>;
+  fn start(&mut self, meta: &Meta, process_chunk: ProcessChunk) -> Result<()>;
 }
 
 #[cfg(feature = "cpal")]

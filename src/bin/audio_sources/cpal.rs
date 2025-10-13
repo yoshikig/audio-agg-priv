@@ -12,12 +12,15 @@ pub struct CpalInput {
 
 impl CpalInput {
   pub fn new(device: cpal::Device) -> Self {
-  use cpal::traits::DeviceTrait;
+    use cpal::traits::DeviceTrait;
 
-    let supported_config = device
-      .default_input_config().ok();
+    let supported_config = device.default_input_config().ok();
 
-    Self { device, supported_config: supported_config, stream: None }
+    Self {
+      device,
+      supported_config: supported_config,
+      stream: None,
+    }
   }
 }
 
@@ -33,18 +36,25 @@ impl InputSource for CpalInput {
   }
 
   fn prepare_meta(&mut self, _opts: &InputOptions) -> Result<Meta> {
-    generate_cpal_meta(&self.device, self.supported_config.as_ref().ok_or(
-      anyhow::anyhow!("no default input device or supported config found"),
-    )?)
+    generate_cpal_meta(
+      &self.device,
+      self.supported_config.as_ref().ok_or(anyhow::anyhow!(
+        "no default input device or supported config found"
+      ))?,
+    )
   }
 
-  fn start(
-    &mut self,
-    meta: &Meta,
-    process_chunk: ProcessChunk,
-  ) -> Result<()> {
-    self.stream =
-      Some(generate_cpal_stream(&self.device, &self.supported_config.as_ref().context("no default input device or supported config found")?.config(), meta.sample_format, process_chunk)?);
+  fn start(&mut self, meta: &Meta, process_chunk: ProcessChunk) -> Result<()> {
+    self.stream = Some(generate_cpal_stream(
+      &self.device,
+      &self
+        .supported_config
+        .as_ref()
+        .context("no default input device or supported config found")?
+        .config(),
+      meta.sample_format,
+      process_chunk,
+    )?);
     Ok(())
   }
 }
@@ -74,7 +84,10 @@ fn generate_cpal_stream(
   Ok(stream)
 }
 
-fn generate_cpal_meta(device: &cpal::Device, supported_config: &cpal::SupportedStreamConfig) -> Result<Meta> {
+fn generate_cpal_meta(
+  device: &cpal::Device,
+  supported_config: &cpal::SupportedStreamConfig,
+) -> Result<Meta> {
   use cpal::traits::DeviceTrait;
 
   // Metadata to include in each packet

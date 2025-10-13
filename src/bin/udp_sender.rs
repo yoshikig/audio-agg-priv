@@ -62,7 +62,7 @@ fn build_input_source(input_mode: InputMode) -> Result<Box<dyn InputSource>> {
     InputMode::WasapiLoopback => {
       use audio_sources::WasapiInput;
       Ok(Box::new(WasapiInput::default()))
-    },
+    }
     InputMode::Stdin => Ok(Box::new(StdinInput)),
   }
 }
@@ -447,15 +447,15 @@ impl SendWorker {
   }
 
   fn process_chunk(&mut self, audio_chunk: &[u8]) -> Result<()> {
-    println!("process_chunk: {} bytes", audio_chunk.len());
-
     // Determine if this chunk is silence and collapse repeated silence
     let bps = bytes_per_sample(self.packet_meta.sample_format);
     let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
     let is_silent =
       aligned && is_silent_chunk(self.packet_meta.sample_format, audio_chunk);
     if is_silent {
-      self.silent_count = self.silent_count.saturating_add((audio_chunk.len() / bps) as u64);
+      self.silent_count = self
+        .silent_count
+        .saturating_add((audio_chunk.len() / bps) as u64);
     } else {
       self.silent_count = 0;
     }
