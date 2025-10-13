@@ -62,6 +62,10 @@ impl VolumeMeter {
     self.push(now, sum_sq, data.len());
   }
 
+  pub fn add_samples_raw(&mut self, now: Instant, sum: f64, len: usize) {
+    self.push(now, sum, len);
+  }
+
   fn push(&mut self, now: Instant, sum_sq: f64, n: usize) {
     self.history.push_back((now, sum_sq, n));
     self.sum_sq += sum_sq;

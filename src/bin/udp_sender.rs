@@ -26,6 +26,10 @@ const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 const STATS_WINDOW: Duration = Duration::from_secs(10);
 const VOLUME_WINDOW: Duration = Duration::from_secs(1);
 
+// Suppress sending silent packets after this many consecutive silent packets
+// (at 48kHz, 4800 packets = 100 ms of silence)
+const SUPPRESS_SILENT_PACKETS_THRESHOLD: u64 = 4800;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
   #[cfg(feature = "cpal")]
@@ -411,7 +415,7 @@ struct SendWorker {
   byte_rate: RollingRate,
   packet_rate: RollingRate,
   warned_sample_align: bool,
-  prev_silent: bool,
+  silent_count: u64,
   update_interval: Duration,
 }
 
@@ -437,29 +441,46 @@ impl SendWorker {
       byte_rate: RollingRate::new(window),
       packet_rate: RollingRate::new(window),
       warned_sample_align: false,
-      prev_silent: false,
+      silent_count: 0,
       update_interval,
     }
   }
 
   fn process_chunk(&mut self, audio_chunk: &[u8]) -> Result<()> {
-    let now_ts = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .unwrap_or_else(|_| Duration::from_millis(0));
-    let ts_ms = now_ts.as_millis() as u64;
+    println!("process_chunk: {} bytes", audio_chunk.len());
+
     // Determine if this chunk is silence and collapse repeated silence
     let bps = bytes_per_sample(self.packet_meta.sample_format);
     let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
     let is_silent =
       aligned && is_silent_chunk(self.packet_meta.sample_format, audio_chunk);
-    let payload: &[u8] = if is_silent && self.prev_silent {
-      &[]
+    if is_silent {
+      self.silent_count = self.silent_count.saturating_add((audio_chunk.len() / bps) as u64);
     } else {
-      audio_chunk
-    };
+      self.silent_count = 0;
+    }
+    if self.silent_count > SUPPRESS_SILENT_PACKETS_THRESHOLD {
+      return self.process_packet(&[]);
+    }
+
+    let mut offset = 0;
+    while offset < audio_chunk.len() {
+      let end = (offset + MAX_PAYLOAD).min(audio_chunk.len());
+      self.process_packet(&audio_chunk[offset..end])?;
+      offset = end;
+    }
+
+    Ok(())
+  }
+
+  fn process_packet(&mut self, payload: &[u8]) -> Result<()> {
+    let now_ts: Duration = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_else(|_| Duration::from_millis(0));
+    let ts_ms = now_ts.as_millis() as u64;
+
     let send_buf =
       encode_packet(self.sequence_number, payload, self.packet_meta, ts_ms);
-    self.prev_silent = is_silent;
 
     if self
       .send_sock
@@ -469,37 +490,39 @@ impl SendWorker {
       // Ignore send errors and continue (nonblocking)
     }
 
-    {
+    let now = Instant::now();
+    if payload.len() > 0 {
       let mut guard = self.meter.lock().unwrap();
-      let now = Instant::now();
       let bps = bytes_per_sample(self.packet_meta.sample_format);
-      let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
+      let aligned = bps == 1 || (payload.len() % bps == 0);
       if !aligned && !self.warned_sample_align {
         eprintln!(
           "warning: payload length {} is not a multiple of 1-sample ({} bytes)",
-          audio_chunk.len(),
+          payload.len(),
           bps
         );
         self.warned_sample_align = true;
       }
       if aligned {
         if self.packet_meta.sample_format == SampleFormat::F32 {
-          let f: &[f32] = bytemuck::cast_slice(audio_chunk);
+          let f: &[f32] = bytemuck::cast_slice(payload);
           guard.add_samples_f32(now, f);
         } else if self.packet_meta.sample_format == SampleFormat::I16 {
-          let f: &[i16] = bytemuck::cast_slice(audio_chunk);
+          let f: &[i16] = bytemuck::cast_slice(payload);
           guard.add_samples_i16(now, f);
         } else if self.packet_meta.sample_format == SampleFormat::U16 {
-          let f: &[u16] = bytemuck::cast_slice(audio_chunk);
+          let f: &[u16] = bytemuck::cast_slice(payload);
           guard.add_samples_u16(now, f);
         } else if self.packet_meta.sample_format == SampleFormat::U32 {
-          let f: &[u32] = bytemuck::cast_slice(audio_chunk);
+          let f: &[u32] = bytemuck::cast_slice(payload);
           guard.add_samples_u32(now, f);
         }
       }
+    } else {
+      // Silent packet
+      self.meter.lock().unwrap().add_samples_raw(now, 0.0, 0);
     }
 
-    let now = Instant::now();
     let sent_packet_size = send_buf.len();
     self.total_bytes_sent += sent_packet_size as u64;
     self.byte_rate.record(now, sent_packet_size as u64);
