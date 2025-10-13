@@ -39,6 +39,8 @@ impl BinarySink {
       .arg(ch)
       .arg("--format")
       .arg(fmt)
+      .arg("--latency")
+      .arg("10ms")
       .arg("-")
       .stdin(Stdio::piped())
       .spawn()?;
