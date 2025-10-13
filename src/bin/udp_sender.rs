@@ -12,7 +12,7 @@ use sound_send::packet::{
   respond_to_ping,
 };
 use sound_send::packet::{Meta, encode_packet};
-use sound_send::rate::RollingRate;
+use sound_send::rate::{RollingMean, RollingRate};
 use sound_send::send_stats::SendStats;
 use sound_send::volume::VolumeMeter;
 
@@ -284,10 +284,11 @@ fn main() -> Result<()> {
       let db = meter.lock().unwrap().dbfs(now);
       print!(
         "\rTotal: {:>7.2} MB | Last 10s avg: {:>7.2} KB/s | Pkts/s: {:>6.1} | \
-         Vol1s: {:>6.1} dBFS   ",
+         Frame: {:>6.2} ms | Vol1s: {:>6.1} dBFS   ",
         stats.total_bytes_sent as f64 / (1024.0 * 1024.0),
         stats.average_rate_bps / 1024.0,
         stats.average_packets_per_sec,
+        stats.average_frame_duration_ms,
         db
       );
       let _ = io::stdout().flush();
@@ -414,6 +415,7 @@ struct SendWorker {
   last_update_time: Instant,
   byte_rate: RollingRate,
   packet_rate: RollingRate,
+  chunk_duration: RollingMean,
   warned_sample_align: bool,
   silent_count: u64,
   update_interval: Duration,
@@ -440,13 +442,44 @@ impl SendWorker {
       last_update_time: Instant::now(),
       byte_rate: RollingRate::new(window),
       packet_rate: RollingRate::new(window),
+      chunk_duration: RollingMean::new(window),
       warned_sample_align: false,
       silent_count: 0,
       update_interval,
     }
   }
 
+  fn record_chunk_duration(&mut self, now: Instant, chunk_len: usize) {
+    if chunk_len == 0 {
+      return;
+    }
+    let channels = self.packet_meta.channels as usize;
+    if channels == 0 {
+      return;
+    }
+    let bytes_per_sample = bytes_per_sample(self.packet_meta.sample_format);
+    if bytes_per_sample == 0 {
+      return;
+    }
+    let frame_bytes = bytes_per_sample * channels;
+    if frame_bytes == 0 || chunk_len % frame_bytes != 0 {
+      return;
+    }
+    let frames = chunk_len / frame_bytes;
+    if frames == 0 {
+      return;
+    }
+    let sample_rate = self.packet_meta.sample_rate.0;
+    if sample_rate == 0 {
+      return;
+    }
+    let duration_secs = frames as f64 / sample_rate as f64;
+    self.chunk_duration.record(now, duration_secs);
+  }
+
   fn process_chunk(&mut self, audio_chunk: &[u8]) -> Result<()> {
+    self.record_chunk_duration(Instant::now(), audio_chunk.len());
+
     // Determine if this chunk is silence and collapse repeated silence
     let bps = bytes_per_sample(self.packet_meta.sample_format);
     let aligned = bps == 1 || (audio_chunk.len() % bps == 0);
@@ -531,10 +564,12 @@ impl SendWorker {
     if now.duration_since(self.last_update_time) >= self.update_interval {
       let average_rate_bps = self.byte_rate.rate_per_sec(now);
       let average_packets_per_sec = self.packet_rate.rate_per_sec(now);
+      let average_frame_duration_ms = self.chunk_duration.average(now) * 1000.0;
       let _ = self.stats_tx.send(SendStats {
         total_bytes_sent: self.total_bytes_sent,
         average_rate_bps,
         average_packets_per_sec,
+        average_frame_duration_ms,
       });
       self.last_update_time = now;
     }
