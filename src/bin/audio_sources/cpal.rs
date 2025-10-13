@@ -6,12 +6,18 @@ use crate::MAX_PAYLOAD;
 
 pub struct CpalInput {
   device: cpal::Device,
+  supported_config: Option<cpal::SupportedStreamConfig>,
   stream: Option<cpal::Stream>,
 }
 
 impl CpalInput {
   pub fn new(device: cpal::Device) -> Self {
-    Self { device, stream: None }
+  use cpal::traits::DeviceTrait;
+
+    let supported_config = device
+      .default_input_config().ok();
+
+    Self { device, supported_config: supported_config, stream: None }
   }
 }
 
@@ -27,7 +33,9 @@ impl InputSource for CpalInput {
   }
 
   fn prepare_meta(&mut self, _opts: &InputOptions) -> Result<Meta> {
-    generate_cpal_meta(&self.device)
+    generate_cpal_meta(&self.device, self.supported_config.as_ref().ok_or(
+      anyhow::anyhow!("no default input device or supported config found"),
+    )?)
   }
 
   fn start(
@@ -36,22 +44,18 @@ impl InputSource for CpalInput {
     process_chunk: ProcessChunk,
   ) -> Result<()> {
     self.stream =
-      Some(generate_cpal_stream(&self.device, meta.sample_format, process_chunk)?);
+      Some(generate_cpal_stream(&self.device, &self.supported_config.as_ref().context("no default input device or supported config found")?.config(), meta.sample_format, process_chunk)?);
     Ok(())
   }
 }
 
 fn generate_cpal_stream(
   device: &cpal::Device,
+  config: &cpal::StreamConfig,
   sample_format: SampleFormat,
   process_chunk: ProcessChunk,
 ) -> Result<cpal::Stream> {
   use cpal::traits::{DeviceTrait, StreamTrait};
-
-  let supported_config = device
-    .default_input_config()
-    .context("failed to get default input config")?;
-  let config = supported_config.config();
 
   let stream: cpal::Stream = match sample_format {
     SampleFormat::F32 => {
@@ -70,7 +74,7 @@ fn generate_cpal_stream(
   Ok(stream)
 }
 
-fn generate_cpal_meta(device: &cpal::Device) -> Result<Meta> {
+fn generate_cpal_meta(device: &cpal::Device, supported_config: &cpal::SupportedStreamConfig) -> Result<Meta> {
   use cpal::traits::DeviceTrait;
 
   // Metadata to include in each packet
@@ -79,13 +83,9 @@ fn generate_cpal_meta(device: &cpal::Device) -> Result<Meta> {
     sample_rate: SampleRate(0),
     sample_format: SampleFormat::F32,
   };
+  let config = supported_config.config();
 
   println!("Input: CPAL (default audio input)");
-  let supported_config = device
-    .default_input_config()
-    .context("failed to get default input config")?;
-
-  let config = supported_config.config();
   eprintln!("Device: {:?}", device.name().ok());
   eprintln!(
     "  Sample Format: {:?}\n  Sample Rate: {} Hz\n  Channels: {}",
@@ -124,19 +124,7 @@ where
   let stream = device.build_input_stream(
     config,
     move |data: &[T], _| {
-      // Data is interleaved. Send in reasonably small chunks.
-      // For now, split the current callback buffer into UDP-sized chunks.
-      let bytes: &[u8] = bytemuck::cast_slice(data);
-      // Split to avoid exceeding typical MTU when adding our ~24-byte header
-      let mut offset = 0;
-      while offset < bytes.len() {
-        let end = (offset + MAX_PAYLOAD).min(bytes.len());
-        let chunk = &bytes[offset..end];
-        if chunker(chunk).is_err() {
-          break;
-        }
-        offset = end;
-      }
+      chunker(bytemuck::cast_slice(data));
     },
     err_fn,
     None,
